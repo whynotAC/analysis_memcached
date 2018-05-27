@@ -1,0 +1,10 @@
+#ifndef TRACE_H
+#define TRACE_H
+
+#define MEMCACHED_SLABS_SLABCLASS_ALLOCATE(arg0)
+
+#define MEMCACHED_SLABS_SLABCLASS_ALLOCATE_FAILED(arg0)
+
+#define MEMCACHED_SLABS_FREE(arg0, arg1, arg2)
+
+#endif
