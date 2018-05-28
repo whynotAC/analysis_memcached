@@ -60,7 +60,7 @@ memcached中使用的关键结构体item，用于管理key-value数据的结构�
 内存模型图示
 --------------------------------------------
 
-![初始化后的内存图示](https://github.com/whynotAC/analysis_memcached/tree/master/memory_init/memcached_init_memory.png)
+![初始化后的内存图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_init/memcached_init_memory.png)
 
 
 初始化参数
