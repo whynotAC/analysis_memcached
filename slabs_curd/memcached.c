@@ -260,3 +260,16 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 
     return stored;
 }
+
+int main (int argc, char **argv) {
+    int retval = EXIT_SUCCESS;
+
+    // init settings
+    settings_init();
+
+    // initialize other stuff
+    assoc_init(settings.hashpower_init);
+    slabs_init(settings.maxbytes, settings.factor, preallocate,
+                use_slab_sizes ? slab_sizes : NULL);
+    return retval;
+}
