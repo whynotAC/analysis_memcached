@@ -9,6 +9,9 @@
 
 #include "assoc.h"
 
+// Locks for cache LRU operations
+pthread_mutex_t lru_locks[POWER_LARGEST];
+
 typedef uint32_t (*hash_func)(const void *key, size_t length);
 extern hash_func hash;
 

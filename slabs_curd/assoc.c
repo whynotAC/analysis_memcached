@@ -1,4 +1,20 @@
 #include "assoc.h"
+
+#include <pthread.h>
+#include <sys/stat.h>
+#include <sys/resource.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <unistd.h>
+
+#include "hash.h"
+#include "trace.h"
 #include "memcached.h"
 
 static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
@@ -36,7 +52,7 @@ void assoc_init(const int hashtable_init) {
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
-    primary_hashtable = calloc(hashsize(hashpower), sizeof(void *));
+    primary_hashtable = (item**)calloc(hashsize(hashpower), sizeof(void *));
     if (! primary_hashtable) {
         fprintf(stderr, "Failed to init hashtable.\n");
         exit(EXIT_FAILURE);
@@ -92,7 +108,7 @@ static item** _hashitem_before(const char *key, const size_t nkey, const uint32_
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
 
-    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    primary_hashtable = (item**)calloc(hashsize(hashpower + 1), sizeof(void *));
     if (primary_hashtable) {
         hashpower++;
         expanding = true;
@@ -156,7 +172,7 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
 static volatile int do_run_maintenance_thread = 1;
 
 #define DEFAULT_HASH_BULK_MOVE 1
-int hash_bulk_move = DEFUALT_HASH_BULK_MOVE;
+int hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
 
 static void *assoc_maintenance_thread(void *arg) {
     

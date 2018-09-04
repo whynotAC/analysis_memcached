@@ -1,6 +1,9 @@
 #ifndef HASH_H
 #define HASH_H
 
+#include <cstdint>
+#include <string.h>
+
 typedef uint32_t (*hash_func)(const void *key, size_t length);
 hash_func hash;
 
