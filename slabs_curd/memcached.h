@@ -155,6 +155,8 @@ void pause_threads(enum pause_thread_types type);
 
 #define refcount_incr(it) ++(it->refcount)
 #define refcount_decr(it) --(it->refcount)
+void STATS_LOCK(void);
+void STATS_UNLOCK(void);
 
 enum store_item_type {
     NOT_STORED=0, STORED, EXISTS, NOT_FOUND, TOO_LARGE, NOT_MEMORY

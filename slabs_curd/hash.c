@@ -1,4 +1,5 @@
-#include "memcache.h"
+#include "hash.h"
+#include "memcached.h"
 #include "jenkins_hash.h"
 #include "murmur3_hash.h"
 

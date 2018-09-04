@@ -1,13 +1,20 @@
 #include "items.h"
 
+#include <cassert>
+
+#include "trace.h"
+
 static void item_link_q(item *it);
 static void item_unlink_q(item *it);
+static void do_item_unlink_q(item *it);
 
 static void item_unlink_q(item *it) {
     pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_unlink_q(it);
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
+
+extern volatile rel_time_t current_time;
 
 int do_item_link(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);

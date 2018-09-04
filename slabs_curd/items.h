@@ -1,6 +1,14 @@
 #ifndef ITEM_H
 #define ITEM_H
 
+#include <cstdint>
+#include <string.h>
+#include <pthread.h>
+
+#include "memcached.h"
+
+extern pthread_mutex_t lru_locks[POWER_LARGEST];
+
 /*@null@*/
 item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags, 
                     const rel_time_t exptime, const int nbytes);
