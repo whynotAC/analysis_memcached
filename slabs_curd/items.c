@@ -1,12 +1,77 @@
 #include "items.h"
 
 #include <cassert>
+#include <pthread.h>
 
+#include "hash.h"
+#include "assoc.h"
 #include "trace.h"
+#include "slabs.h"
 
 static void item_link_q(item *it);
 static void item_unlink_q(item *it);
 static void do_item_unlink_q(item *it);
+
+static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU};
+
+#define LARGEST_ID POWER_LARGEST
+typedef struct {
+    uint64_t evicted;
+    uint64_t evicted_nonzero;
+    uint64_t reclaimed;
+    uint64_t outofmemory;
+    uint64_t tailrepairs;
+    uint64_t expired_unfetched; // items reclaimed but never touched
+    uint64_t evicted_unfetched; // items evicted but never touched
+    uint64_t evicted_active;    // items evicted that should have been shuffled
+    uint64_t crawler_reclaimed;
+    uint64_t crawler_items_checked;
+    uint64_t lrutail_reflocked;
+    uint64_t moves_to_cold;
+    uint64_t moves_to_warm;
+    uint64_t moves_within_lru;
+    uint64_t direct_reclaims;
+    uint64_t hits_to_hot;
+    uint64_t hits_to_warm;
+    uint64_t hits_to_cold;
+    uint64_t hits_to_temp;
+    rel_time_t evicted_time;
+} itemstats_t;
+
+static item *heads[LARGEST_ID];
+static item *tails[LARGEST_ID];
+static itemstats_t itemstats[LARGEST_ID];
+static unsigned int sizes[LARGEST_ID];
+static uint64_t sizes_bytes[LARGEST_ID];
+static unsigned int *stats_sizes_hist = NULL;
+static uint64_t stats_sizes_cas_min = 0;
+static int stats_sizes_buckets = 0;
+
+static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t stats_sizes_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned int temp_lru_size(int slabs_clsid) {
+    int id = CLEAR_LRU(slabs_clsid);
+    id |= TEMP_LRU;
+    unsigned int ret;
+    pthread_mutex_lock(&lru_locks[id]);
+    ret = sizes_bytes[id];
+    pthread_mutex_unlock(&lru_locks[id]);
+    return ret;
+}
+
+
+// Enable this for reference-count debugging
+#if 1
+#define DEBUG_REFCNT(it,op) \
+                fprintf(stderr, "item %x refcnt(%c) %d %c%c%c\n", \
+                    it, op, it->refcount, \
+                    (it->it_flags & ITEM_LINKED) ? 'L' : ' ', \
+                    (it->it_flags & ITEM_SLABBED) ? 'S': ' ')
+#else
+#define DEBUG_REFCNT(it,op) while(0)
+#endif
+
 
 static void item_unlink_q(item *it) {
     pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
@@ -143,6 +208,24 @@ void do_item_remove(item *it) {
     }
 }
 
+/**
+ * Copy/paste to avoid adding two extra branches for all common calls, since
+ * _nolock is only used in an uncommon case where we want to relink
+ */
+
+void do_item_update_nolock(item *it) {
+    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            do_item_unlink_q(it);
+            it->time = current_time;
+            do_item_link_q(it);
+        }
+    }
+}
+
 int do_item_replace(item *it, item *new_it, const uint32_t hv) {
     MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
                             ITEM_key(new_it), new_it->nkey, new_it->nbytes);
@@ -180,7 +263,7 @@ void item_stats_sizes_add(item *it) {
  *  validation
  */
 void item_stats_sizes_remove(item *it) {
-    if (stats_size_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
         return;
     int ntotal = ITEM_ntotal(it);
     int bucket = ntotal / 32;
@@ -202,7 +285,7 @@ void item_stats_sizes_remove(item *it) {
  */
 static size_t item_make_header(const uint8_t nkey, const unsigned int flags, const int nbytes,
                                char *suffix, uint8_t *nsuffix) {
-    if (settings.inline_asscii_response) {
+    if (settings.inline_ascii_response) {
         /* suffix is defined at 40 chars elsewhere...*/
         *nsuffix = (uint8_t)snprintf(suffix, 40, " %u %d\r\n", flags, nbytes - 2);
     } else {
@@ -230,10 +313,10 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
         if (!settings.lru_segmented) {
             lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
         }
-        it = slabs_alloc(ntotal, id, &total_bytes, 0);
+        it = (item *)slabs_alloc(ntotal, id, &total_bytes, 0);
 
         if (settings.temp_lru)
-            total_bytes -= tem_lru_size(id);
+            total_bytes -= temp_lru_size(id);
 
         if (it == NULL) {
             if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
@@ -333,7 +416,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
     it->nbytes = nbytes;
     memcpy(ITEM_key(it), key, nkey);
     it->exptime = exptime;
-    if (settings.inline_asscii_response) {
+    if (settings.inline_ascii_response) {
         memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
     } else if (nsuffix > 0) {
         memcpy(ITEM_suffix(it), &flags, sizeof(flags));
@@ -348,7 +431,7 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         chunk->prev = 0;
         chunk->used = 0;
         chunk->size = 0;
-        chunk->head = it;
+        chunk->head = (item_chunk*)it;
         chunk->orig_clsid = hdr_id;
     }
     it->h_next = 0;

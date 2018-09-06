@@ -17,12 +17,38 @@
 /* slab class max is a 6-bit number, -1. */
 #define MAX_NUMBER_OF_SLAB_CLASSES (63 + 1)
 
+/**
+ * How long an object can reasonably be assumed to be locked before
+ * harvesting it on a low memory condition. Default: disabled
+ */
+#define TAIL_REPAIR_TIME_DEFAULT 0
+
+// warning: don't use these macros with a function, as it evals its arg twice
+#define ITEM_get_cas(item) (((item)->it_flags & ITEM_CAS) ? \
+        (item)->data->cas : (uint64_t)0)
+
+#define ITEM_set_cas(item,v) { \
+    if ((item)->it_flags & ITEM_CAS) { \
+        (item)->data->cas = v; \
+    } \
+}
+
 #define ITEM_key(item) (((char*)&((item)->data)) \
+        + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_suffix(item) ((char*) &((item)->data) + (item)->nkey + 1 \
         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
 
 #define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
         + (item)->nsuffix \
         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
+        + (item)->nsuffix + (item)->nbytes \
+        + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
+#define ITEM_lruid(item) ((item)->slabs_clsid & (3<<6))
 
 #define ITEM_LINKED 1
 #define ITEM_CAS 2
@@ -46,7 +72,58 @@
 #define HASHPOWER_DEFAULT 16
 #define HASHPOWER_MAX 32
 
+extern struct stats stats;
+extern struct stats_state stats_state;
 extern struct settings settings;
+
+/**
+ * Global stats. Only resettable stats should go into this structure.
+ */
+struct stats {
+    uint64_t        total_items;
+    uint64_t        total_conns;
+    uint64_t        rejected_conns;
+    uint64_t        malloc_fails;
+    uint64_t        listen_disabled_num;
+    uint64_t        slabs_moved;        // times slabs were moved around
+    uint64_t        slab_reassign_rescues; // items rescued during slab move
+    uint64_t        slab_reassign_evictions_nomem; // valid items lost during slab move
+    uint64_t        slab_reassign_inline_reclaim; // valid items lost during slab move
+    uint64_t        slab_reassign_chunk_rescues;  // chunked-item chunks recovered
+    uint64_t        slab_reassign_busy_items;   // valid temporarily unmovable
+    uint64_t        slab_reassign_busy_deletes; // refcounted items killed
+    uint64_t        lru_crawler_starts; // Number of item crawlers kicked off
+    uint64_t        lru_maintainer_juggles; // number of LRU bg pokes
+    uint64_t        time_in_listen_disalbed_us; // elapsed time in microseconds while server unable to process new connections
+    uint64_t        log_worker_dropped;     // logs dropped by worker threads
+    uint64_t        log_worker_written;     // logs written by worker threads
+    uint64_t        log_watcher_skipped;    // logs watchers missed
+    uint64_t        log_watcher_sent;       // logs sent to watcher buffers
+#ifdef EXTSTORE
+    uint64_t        extstore_compact_lost;      // items lost becasue they were locked
+    uint64_t        extstore_compact_rescues;   // items re-written during compaction
+    uint64_t        extstore_compact_skipped;   // unhit items skipped during compaction
+#endif
+    struct timeval  maxconns_entered;       // last time maxconns entered
+};
+
+/**
+ * Glocal "state" stats. Reflects state that shouldn't be wiped ever.
+ * Ordered for some cache line locality for commonly updated counters.
+ */
+struct stats_state {
+    uint64_t        curr_items;
+    uint64_t        curr_bytes;
+    uint64_t        curr_conns;
+    uint64_t        hash_bytes; // size used for hash tables
+    unsigned int    conn_structs;
+    unsigned int    reserved_fds;
+    unsigned int    hash_power_level;   // Better hope it's not over 9000
+    bool            hash_is_expanding;  // If the hash table is being expanded
+    bool            accepting_conns;    // whether we are currently accepting
+    bool            slab_reassign_running; // slab reassign in progress
+    bool            lru_crawler_running;    // crawl in progress
+};
 
 /*
  *  Globally accessible settings as derived from the commandline.
@@ -60,11 +137,17 @@ struct settings {
     bool use_cas;
     int slab_chunk_size_max;    // Upper end for chunks within slab pages
     int slab_page_size;         // Slab's page units.(划分内存空间的单位大小，默认为1M)
+    bool lru_segmented;         // Use split or flat LRU's (是否使用lru分片)
     bool slab_reassign;         // Whether or not slab reassignment is allowed
                                 // (是否按照slab_page_size进行页面分配，以便后面进行页面automoved)
     char *hash_algorithm;       // Hash algorithm in use(Hash表使用的Hash算法)
+    int hot_lru_pct;            // percentage of slab space for HOT_LRU (HOT_LRU链所占用的空间大小比例)
+    int warm_lru_pct;           // percentage of slab space for WARM_LRU (WARM_LRU链所占用的空间大小比例)
     int hashpower_init;         // Starting hash power level(Hash表的大小)
+    
+    int tail_repair_time;       // LRU tail refcount leak repair time (将worker线程使用的item强制释放的时间)
 
+    bool inline_ascii_response; // pre-format the VALUE line for ASCII response (将value转变成ascii字符串)
     bool temp_lru;              // TTL < temporary_ttl uses TEMP_LR(是否启用TEMP_LRU链表)
     uint32_t temporary_ttl;     // temporay LRU threshold (item加入TEMP_LRU的时间戳)
 
