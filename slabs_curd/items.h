@@ -7,6 +7,17 @@
 
 #include "memcached.h"
 
+#define HOT_LRU 0
+#define WARM_LRU 64
+#define COLD_LRU 128
+#define TEMP_LRU 192
+
+#define CLEAR_LRU(id) (id & ~(3<<6))
+#define GET_LRU(id) (id & (3<<6))
+
+// see items.c
+uint64_t get_cas_id(void);
+
 extern pthread_mutex_t lru_locks[POWER_LARGEST];
 
 /*@null@*/
@@ -22,6 +33,10 @@ void do_item_remove(item *it);
 int do_item_replace(item *it, item *new_it, const uint32_t hv);
 
 int item_is_flushed(item *it);
+
+#define LRU_PULL_EVICT 1
+#define LRU_PULL_CRAWL_BLOCKS 2
+#define LRU_PULL_RETURN_ITEM 4
 
 struct lru_pull_tail_return {
     item *it;

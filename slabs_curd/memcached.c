@@ -22,8 +22,13 @@ static void settings_init(void) {
     settings.slab_reassign = true;
     settings.hashpower_init = 0;
     settings.num_threads = 4; // N workers
-    settings.tem_lru = false;
+    settings.temp_lru = false;
     settings.temporary_ttl = 61;
+    settings.inline_asscii_response = false;
+    settings.lru_segmented = true;
+    settings.hot_lru_pct = 20;
+    settings.warm_lru_pct = 40;
+    settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
 }
 
 /*
