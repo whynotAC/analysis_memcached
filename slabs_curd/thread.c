@@ -1,5 +1,3 @@
-#include "memcached.h"
-
 #include <assert.h>
 #include <stdio.h>
 #include <errno.h>
@@ -8,12 +6,17 @@
 #include <pthread.h>
 
 #include "assoc.h"
+#include "items.h"
+#include "memcached.h"
 
 // Locks for cache LRU operations
 pthread_mutex_t lru_locks[POWER_LARGEST];
 
 typedef uint32_t (*hash_func)(const void *key, size_t length);
 extern hash_func hash;
+
+// lock for global stats
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_mutex_t *item_locks;
 /* size of the item lock hash table */
@@ -140,7 +143,7 @@ void item_remove(item *item) {
  * Unprotected by a mutex lock since the core server does not require
  * it to be thread-safe.
  */
-void item_replace(item *old_it, item *new_it, const uint32_t hv) {
+int item_replace(item *old_it, item *new_it, const uint32_t hv) {
     return do_item_replace(old_it, new_it, hv);
 }
 
@@ -165,7 +168,7 @@ enum delta_result_type add_delta(conn *c, const char *key,
     enum delta_result_type ret;
     uint32_t hv;
 
-    hv = hash(ITEM_key(item), item->nkey);
+    hv = hash(key, nkey);
     item_lock(hv);
     ret = do_add_delta(c, key, nkey, incr, delta, buf, cas, hv);
     item_unlock(hv);
@@ -220,13 +223,13 @@ void memcached_thread_init(int nthreads, void *arg) {
         power = 14;
     } else {
         // 32 buckets, just under the hashpower default
-        pwoer = 15;
+        power = 15;
     }
 
     if (power >= hashpower) {
         fprintf(stderr, "Hash table power size (%d) cannot be equal to or less than item lock table (%d)\n", hashpower, power);
         fprintf(stderr, "Item lock table grows with `-t N` (worker threadcount)\n");
-        fprtinf(stderr, "Hash table grows with `-o hashpower=N`\n");
+        fprintf(stderr, "Hash table grows with `-o hashpower=N`\n");
         exit(1);
     }
 

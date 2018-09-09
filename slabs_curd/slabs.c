@@ -13,7 +13,10 @@
 #include <assert.h>
 #include <pthread.h>
 
+#include "trace.h"
 #include "memcached.h"
+
+extern volatile int slab_rebalance_signal;
 
 /*
  * #define DEBUG_SLAB_MOVER
@@ -53,6 +56,7 @@ static void *storage = NULL;
  * Access to the slab allocator is protected by this lock
  */
 static pthread_mutex_t slabs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t slabs_rebalance_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * Forward Declarations
@@ -122,7 +126,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
 
     while (++i < MAX_NUMBER_OF_SLAB_CLASSES - 1) {
         if (slab_sizes != NULL) {
-            if (slab_size[i-1] == 0) {
+            if (slab_sizes[i-1] == 0) {
                 break;
             }
             size = slab_sizes[i-1];
@@ -185,6 +189,22 @@ static void slabs_preallocate(const unsigned int maxslabs) {
     }
 }
 
+/* The slabber system could avoid needing to understand much. if anything,
+ * about items if callbacks were stategically used. Due to how the slab mover
+ * works, certain flag bits can only be adjusted while holding the slabs lock.
+ * Using these functions, isolate sections of code needing this and turn them
+ * into callbacks when an interface becomes more abvious.
+ */
+void slabs_mlock(void) {
+    pthread_mutex_lock(&slabs_lock);
+}
+
+void slabs_munlock(void) {
+    pthread_mutex_unlock(&slabs_lock);
+}
+
+static pthread_cond_t slab_rebalance_cond = PTHREAD_COND_INITIALIZER;
+
 void slabs_free(void *ptr, size_t size, unsigned int id) {
     pthread_mutex_lock(&slabs_lock);
     do_slabs_free(ptr, size, id);
@@ -211,7 +231,7 @@ static void do_slabs_free_chunked(item *it, const size_t size) {
     // return the header object
     // TODO: This is in three places, here and in do_slabs_free()
     it->prev = 0;
-    it->next = p->slots;
+    it->next = (item *)p->slots;
     if (it->next) it->next->prev = it;
     p->slots = it;
     p->sl_curr++;
@@ -230,7 +250,7 @@ static void do_slabs_free_chunked(item *it, const size_t size) {
         next_chunk = chunk->next;
 
         chunk->prev = 0;
-        chunk->next = p->slots;
+        chunk->next = (item_chunk *)p->slots;
         if (chunk->next) chunk->next->prev = chunk;
         p->slots = chunk;
         p->sl_curr++;
@@ -261,7 +281,7 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
         it->it_flags = ITEM_SLABBED;
         it->slabs_clsid = 0;
         it->prev = 0;
-        it->next = p->slots;
+        it->next = (item *)p->slots;
         if (it->next) it->next->prev = it;
         p->slots = it;
 
@@ -279,16 +299,6 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
         do_slabs_free_chunked(it, size);
     }
     return;
-}
-
-void *slabs_alloc(size_t size, unsigned int id, uint64_t *total_bytes,
-                    unsigned int flags) {
-    void *ret;
-
-    pthread_mutex_lock(&slabs_lock);
-    ret = do_slabs_alloc(size, id, total_bytes, flags);
-    pthread_mutex_unlock(&slabs_lock);
-    return ret;
 }
 
 static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_bytes,
@@ -346,10 +356,42 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
     return ret;
 }
 
+void *slabs_alloc(size_t size, unsigned int id, uint64_t *total_bytes,
+                    unsigned int flags) {
+    void *ret;
+
+    pthread_mutex_lock(&slabs_lock);
+    ret = do_slabs_alloc(size, id, total_bytes, flags);
+    pthread_mutex_unlock(&slabs_lock);
+    return ret;
+}
+
+/*
+ *  fast FIFO queue
+ */
+static void *get_page_from_global_pool(void) {
+    slabclass_t *p = &slabclass[SLAB_GLOBAL_PAGE_POOL];
+    if (p->slabs < 1) {
+        return NULL;
+    }
+    char *ret = (char *)(p->slab_list[p->slabs - 1]);
+    p->slabs--;
+    return ret;
+}
+
+static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
+    slabclass_t *p = &slabclass[id];
+    int x;
+    for (x = 0; x < p->perslab; x++) {
+        do_slabs_free(ptr, 0, id);
+        ptr += p->size;
+    }
+}
+
 static int do_slabs_newslab(const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     slabclass_t *g = &slabclass[SLAB_GLOBAL_PAGE_POOL];
-    int len = (settings.slabs_reassign || settings.slab_chunk_size_max != settings.slab_page_size)
+    int len = (settings.slab_reassign || settings.slab_chunk_size_max != settings.slab_page_size)
               ? settings.slab_page_size : p->size * p->perslab;
     char *ptr;
 
@@ -361,8 +403,8 @@ static int do_slabs_newslab(const unsigned int id) {
     }
 
     if ((grow_slab_list(id) == 0) ||
-        (((ptr = get_page_from_global_pool()) == NULL) && 
-        ((ptr = memory_allocate((size_t)len)) == 0))) {
+        (((ptr = (char *)(get_page_from_global_pool())) == NULL) && 
+        ((ptr = (char *)(memory_allocate((size_t)len))) == 0))) {
         
         MEMCACHED_SLABS_SLABCLASS_ALLOCATE_FAILED(id);
         return 0;
@@ -384,22 +426,9 @@ static int grow_slab_list(const unsigned int id) {
         void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
         if (new_list == 0) return 0;
         p->list_size = new_size;
-        p->slab_list = new_list;
+        p->slab_list = (void **)new_list;
     }
     return 1;
-}
-
-/*
- *  fast FIFO queue
- */
-static void *get_page_from_global_pool(void) {
-    slabclass_t *p = &slabclass[SLAB_GLOBAL_PAGE_POOL];
-    if (p->slabs < 1) {
-        return NULL;
-    }
-    char *ret = p->slab_list[p->slabs - 1];
-    p->slabs--;
-    return ret;
 }
 
 static void *memory_allocate(size_t size) {
@@ -434,11 +463,67 @@ static void *memory_allocate(size_t size) {
     return ret;
 }
 
-static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
-    slabclass_t *p = &slabclass[id];
-    int x;
-    for (x = 0; x < p->perslab; x++) {
-        do_slabs_free(ptr, 0, id);
-        ptr += p->size;
+/**
+ * Iterate at most once through the slab classes and pick a "random" source.
+ * I like this better than calling rand() since rand() is slow enough that we
+ * can just check all of the classes once instead.
+ */
+static int slab_reassign_pick_any(int dst) {
+    static int cur = POWER_SMALLEST - 1;
+    int tries = power_largest - POWER_SMALLEST + 1;
+    for (; tries > 0; tries--) {
+        cur++;
+        if (cur > power_largest)
+            cur = POWER_SMALLEST;
+        if (cur == dst) 
+            continue;
+        if (slabclass[cur].slabs > 1) {
+            return cur;
+        }
     }
+    return -1;
+}
+
+static enum reassign_result_type do_slabs_reassign(int src, int dst) {
+    bool nospare = false;
+    if (slab_rebalance_signal != 0) 
+        return REASSIGN_RUNNING;
+
+    if (src == dst)
+        return REASSIGN_SRC_DST_SAME;
+
+    // Special indicator to choose ourselves
+    if (src == -1) {
+        src = slab_reassign_pick_any(dst);
+        // TODO: if we end up back at -1, return a new error type
+    }
+
+    if (src < SLAB_GLOBAL_PAGE_POOL || src > power_largest ||
+        dst < SLAB_GLOBAL_PAGE_POOL || dst > power_largest)
+        return REASSIGN_BADCLASS;
+
+    pthread_mutex_lock(&slabs_lock);
+    if (slabclass[src].slabs < 2)
+        nospare = true;
+    pthread_mutex_unlock(&slabs_lock);
+    if (nospare)
+        return REASSIGN_NOSPARE;
+
+    slab_rebal.s_clsid = src;
+    slab_rebal.d_clsid = dst;
+
+    slab_rebalance_signal = 1;
+    pthread_cond_signal(&slab_rebalance_cond);
+
+    return REASSIGN_OK;
+}
+
+enum reassign_result_type slabs_reassign(int src, int dst) {
+    enum reassign_result_type ret;
+    if (pthread_mutex_trylock(&slabs_rebalance_lock) != 0) {
+        return REASSIGN_RUNNING;
+    }
+    ret = do_slabs_reassign(src, dst);
+    pthread_mutex_unlock(&slabs_rebalance_lock);
+    return ret;
 }

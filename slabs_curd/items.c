@@ -3,16 +3,42 @@
 #include <cassert>
 #include <pthread.h>
 
-#include "hash.h"
 #include "assoc.h"
 #include "trace.h"
 #include "slabs.h"
+#include "logger.h"
+#include "bipbuffer.h"
+#include "memcached.h"
+
+typedef uint32_t (*hash_func)(const void *key, size_t length);
+extern hash_func hash;
 
 static void item_link_q(item *it);
 static void item_unlink_q(item *it);
 static void do_item_unlink_q(item *it);
 
 static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU};
+
+typedef struct _lru_bump_buf {
+    struct _lru_bump_buf *prev;
+    struct _lru_bump_buf *next;
+    pthread_mutex_t mutex;
+    bipbuf_t *buf;
+    uint64_t dropped;
+} lru_bump_buf;
+
+typedef struct {
+    item *it;
+    uint32_t hv;
+} lru_bump_entry;
+
+static lru_bump_buf *bump_buf_head = NULL;
+static lru_bump_buf *bump_buf_tail = NULL;
+static pthread_mutex_t bump_buf_lock = PTHREAD_MUTEX_INITIALIZER;
+// TODO: tunable? Need bench results
+#define LRU_BUMP_BUF_SIZE 8192
+
+static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv);
 
 #define LARGEST_ID POWER_LARGEST
 typedef struct {
@@ -49,6 +75,18 @@ static int stats_sizes_buckets = 0;
 
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t stats_sizes_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/**
+ * Get the next CAS id for a new item.
+ * TODO: refactor some atomics for this
+ */
+uint64_t get_cas_id(void) {
+    static uint64_t cas_id = 0;
+    pthread_mutex_lock(&cas_id_lock);
+    uint64_t next_id = ++cas_id;
+    pthread_mutex_unlock(&cas_id_lock);
+    return next_id;
+}
 
 static unsigned int temp_lru_size(int slabs_clsid) {
     int id = CLEAR_LRU(slabs_clsid);
@@ -133,6 +171,13 @@ static void do_item_link_q(item *it) { // item is the new head
 static void item_link_q(item *it) {
     pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_link_q(it);
+    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+}
+
+static void item_link_q_warm(item *it) {
+    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    do_item_link_q(it);
+    itemstats[it->slabs_clsid].moves_to_warm++;
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
 }
 
@@ -222,6 +267,36 @@ void do_item_update_nolock(item *it) {
             do_item_unlink_q(it);
             it->time = current_time;
             do_item_link_q(it);
+        }
+    }
+}
+
+// Bump the last accessed time, or relink if we're in compat mode
+void do_item_update(item *it) {
+    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+
+    // Hits to COLD_LRU immediately move to WARM
+    if (settings.lru_segmented) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            if (ITEM_lruid(it) == COLD_LRU && (it->it_flags & ITEM_ACTIVE)) {
+                it->time = current_time;
+                item_unlink_q(it);
+                it->slabs_clsid = ITEM_clsid(it);
+                it->slabs_clsid |= WARM_LRU;
+                it->it_flags &= ~ITEM_ACTIVE;
+                item_link_q_warm(it);
+            } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+                it->time = current_time;
+            }
+        }
+    } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            it->time = current_time;
+            item_unlink_q(it);
+            item_link_q(it);
         }
     }
 }
@@ -338,6 +413,38 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
     }
 
     return it;
+}
+
+/**
+ * Chain another chunk onto this chunk
+ * slab mover: if it finds a chunk without ITEM_CHUNK flag, and no ITEM_LINKED
+ * flag, it counts as busy and skips.
+ * I think it might still not be safe to do linking outside of the slab lock.
+ */
+item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain) {
+    // TODO: Should be a cleaner way of finding real size with slabber calls
+    size_t size = bytes_remain + sizeof(item_chunk);
+    if (size > settings.slab_chunk_size_max)
+        size = settings.slab_chunk_size_max;
+    unsigned int id = slabs_clsid(size);
+
+    item_chunk *nch = (item_chunk *) do_item_alloc_pull(size, id);
+    if (nch == NULL)
+        return NULL;
+
+    // link in
+    // ITEM_CHUNK[ED] bits need to be protected by the slabs lock
+    slabs_mlock();
+    nch->head = ch->head;
+    ch->next = nch;
+    nch->prev = ch;
+    nch->next = 0;
+    nch->used = 0;
+    nch->slabs_clsid = id;
+    nch->size = size - sizeof(item_chunk);
+    nch->it_flags |= ITEM_CHUNK;
+    slabs_munlock();
+    return nch;
 }
 
 item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
@@ -617,7 +724,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
         }
     }
 
-    return moved;
+    return removed;
 }
 
 int item_is_flushed(item *it) {
@@ -716,7 +823,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
                             it->it_flags |= ITEM_ACTIVE;
                             if (ITEM_lruid(it) != COLD_LRU) {
                                 do_item_update(it); // bump LA time
-                            } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                            } else if (!lru_bump_async((lru_bump_buf *)c->thread->lru_bump_buf, it, hv)) {
                                 // add flag before async bump to avoid race.
                                 it->it_flags &= ~ITEM_ACTIVE;
                             }
@@ -746,4 +853,27 @@ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
         it->exptime = exptime;
     }
     return it;
+}
+
+static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
+    bool ret = false;
+    refcount_incr(it);
+    pthread_mutex_lock(&b->mutex);
+    lru_bump_entry *be = (lru_bump_entry *) bipbuf_request(b->buf, sizeof(lru_bump_entry));
+    if (be != NULL) {
+        be->it = it;
+        be->hv = hv;
+        if (bipbuf_push(b->buf, sizeof(lru_bump_entry)) == 0) {
+            ret = false;
+            b->dropped++;
+        }
+    } else {
+        ret = false;
+        b->dropped++;
+    }
+    if (!ret) {
+        refcount_decr(it);
+    }
+    pthread_mutex_unlock(&b->mutex);
+    return ret;
 }

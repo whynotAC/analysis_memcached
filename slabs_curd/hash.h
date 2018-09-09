@@ -1,5 +1,4 @@
-#ifndef HASH_H
-#define HASH_H
+#pragma once
 
 #include <cstdint>
 #include <string.h>
@@ -12,5 +11,3 @@ enum hashfunc_type {
 };
 
 int hash_init(enum hashfunc_type type);
-
-#endif
