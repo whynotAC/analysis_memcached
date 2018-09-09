@@ -1,5 +1,10 @@
 #pragma once
 
+#include <string>
+#include <cstdint>
+#include <cstring>
+#include <errno.h>
+
 /*
  * Wrappers around strtoull/strtoll that are safer and easier to
  * use.  for tests and assumptions, see internal_tests.c.

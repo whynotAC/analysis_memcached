@@ -13,9 +13,10 @@
 #include <assert.h>
 #include <unistd.h>
 
-#include "hash.h"
 #include "trace.h"
-#include "memcached.h"
+
+typedef uint32_t (*hash_func)(const void *key, size_t length);
+extern hash_func hash;
 
 static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;

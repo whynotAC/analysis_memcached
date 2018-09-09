@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 /**
  * Init the subsystem. 1st argument is  the limit on no. of bytes to allocate,
  * 0 if no limit. 2nd argument is the growth factor; each slab will use a chunk
@@ -21,3 +23,13 @@ void *slabs_alloc(const size_t size, unsigned int id, uint64_t *total_bytes, uns
 
 /** Free previously allocated object */
 void slabs_free(void *ptr, size_t size, unsigned int id);
+
+void slabs_mlock(void);
+void slabs_munlock(void);
+
+enum reassign_result_type {
+    REASSIGN_OK=0, REASSIGN_RUNNING, REASSIGN_BADCLASS, REASSIGN_NOSPARE,
+    REASSIGN_SRC_DST_SAME
+};
+
+enum reassign_result_type slabs_reassign(int src, int dst);

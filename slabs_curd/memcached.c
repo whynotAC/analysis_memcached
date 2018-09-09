@@ -1,13 +1,18 @@
 #include "memcached.h"
 
-#include "hash.h"
+#include "util.h"
+#include "trace.h"
+#include "items.h"
 #include "assoc.h"
+#include "slabs.h"
 
+extern uint64_t get_cas_id(void);
+extern void item_remove(item *item);
+extern int item_replace(item *old_it, item *new_it, const uint32_t hv);
 extern enum hashfunc_type {
     JENKINS_HASH = 0,
     MURMUR3_HASH
 };
-
 extern int hash_init(enum hashfunc_type type);
 
 static void settings_init(void) {
@@ -15,8 +20,10 @@ static void settings_init(void) {
     
     settings.maxbytes = 64 * 1024 * 1024; // default is 64MB
     settings.verbose = 0;
+    settings.evict_to_free = 1;     // push old items out of cache when memory runs out
     settings.factor = 1.25;
     settings.chunk_size = 48; // space for a modest key and value
+    settings.item_size_max = 1024 * 1024; // The famous 1MB upper limit
     settings.slab_page_size = 1024 * 1024; // chunks are split from 1MB pages
     settings.slab_chunk_size_max = settings.slab_page_size / 2;
     settings.slab_reassign = true;
@@ -24,11 +31,14 @@ static void settings_init(void) {
     settings.num_threads = 4; // N workers
     settings.temp_lru = false;
     settings.temporary_ttl = 61;
-    settings.inline_asscii_response = false;
+    settings.inline_ascii_response = false;
     settings.lru_segmented = true;
     settings.hot_lru_pct = 20;
     settings.warm_lru_pct = 40;
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
+    settings.slab_automove = 1;
+    settings.oldest_live = 0;
+    settings.oldest_cas = 0; // supplements accuracy of oldest_live
 }
 
 /*
@@ -119,12 +129,12 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
         do_item_update(it);
     } else if (it->refcount > 1) {
-        item *net_it;
+        item *new_it;
         uint32_t flags;
-        if (settings.inline_asscii_response) {
+        if (settings.inline_ascii_response) {
             flags = (uint32_t) strtoul(ITEM_suffix(it), (char **)NULL, 10);
         } else if (it->nsuffix > 0) {
-            flags = *((uint32_t *)ITEM_sufffix(it));
+            flags = *((uint32_t *)ITEM_suffix(it));
         } else {
             flags = 0;
         }
@@ -157,6 +167,106 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     }
     do_item_remove(it);     // release our reference
     return OK;
+}
+
+/** Destination must always be chunked.
+ * This should be part of item.c
+ */
+static int _store_item_copy_chunks(item *d_it, item *s_it, const int len) {
+    item_chunk *dch = (item_chunk *) ITEM_data(d_it);
+    // Advance dch until we find free space
+    while (dch->size == dch->used) {
+        if (dch->next) {
+            dch = dch->next;
+        } else {
+            break;
+        }
+    }
+
+    if (s_it->it_flags & ITEM_CHUNKED) {
+        int remain = len;
+        item_chunk *sch = (item_chunk *) ITEM_data(s_it);
+        int copied = 0;
+        /**
+         * Fills dch's to capacity, not straight copy sch in case data is
+         * being added or removed (ie append/prepend)
+         */
+        while (sch && dch && remain) {
+            assert(dch->used <= dch->size);
+            int todo = (dch->size - dch->used < sch->used - copied)
+              ? dch->size - dch->used : sch->used - copied;
+            if (remain < todo) 
+                todo = remain;
+            memcpy(dch->data + dch->used, sch->data + copied, todo);
+            dch->used += todo;
+            copied += todo;
+            remain -= todo;
+            assert(dch->used <= dch->size);
+            if (dch->size == dch->used) {
+                item_chunk *tch = do_item_alloc_chunk(dch, remain);
+                if (tch) {
+                    dch = tch;
+                } else {
+                    return -1;
+                }
+            }
+            assert(copied <= sch->used);
+            if (copied == sch->used) {
+                copied = 0;
+                sch = sch->next;
+            }
+        }
+        // assert that the destination had enough space for source
+        assert(remain == 0);
+    } else {
+        int done = 0;
+        // Fill dch's via a non-chunked item.
+        while (len > done && dch) {
+            int todo = (dch->size - dch->used < len - done)
+              ? dch->size - dch->used : len - done;
+            // assert(dch->size - dch->used != 0);
+            memcpy(dch->data + dch->used, ITEM_data(s_it) + done, todo);
+            done += todo;
+            dch->used += todo;
+            assert(dch->used <= dch->size);
+            if (dch->size == dch->used) {
+                item_chunk *tch = do_item_alloc_chunk(dch, len - done);
+                if (tch) {
+                    dch = tch;
+                } else {
+                    return -1;
+                }
+            }
+        }
+        assert(len == done);
+    }
+    return 0;
+}
+
+static int _store_item_copy_data(int comm, item *old_it, item *new_it, item *add_it) {
+    if (comm == NREAD_APPEND) {
+        if (new_it->it_flags & ITEM_CHUNKED) {
+            if (_store_item_copy_chunks(new_it, old_it, old_it->nbytes - 2) == -1 ||
+                _store_item_copy_chunks(new_it, add_it, add_it->nbytes) == -1) {
+                return -1;
+            }
+        } else {
+            memcpy(ITEM_data(new_it), ITEM_data(old_it), old_it->nbytes);
+            memcpy(ITEM_data(new_it) + old_it->nbytes - 2 /* CRLF */, ITEM_data(add_it), add_it->nbytes);
+        }
+    } else {
+        /* NREAD_PREPEND */
+        if (new_it->it_flags & ITEM_CHUNKED) {
+            if (_store_item_copy_chunks(new_it, add_it, add_it->nbytes - 2) == -1 ||
+                _store_item_copy_chunks(new_it, old_it, old_it->nbytes) == -1) {
+                return -1;
+            }
+        } else {
+            memcpy(ITEM_data(new_it), ITEM_data(add_it), add_it->nbytes);
+            memcpy(ITEM_data(new_it) + add_it->nbytes - 2 /* CRLF */, ITEM_data(old_it), old_it->nbytes);
+        }
+    }
+    return 0;
 }
 
 /*
@@ -240,7 +350,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                 /* we have it and old_it here - alloc memory to hold both
                  * flags was already lost - so recover them from ITEM_suffix(it)
                  */
-                if (settings.inline_asscii_response) {
+                if (settings.inline_ascii_response) {
                     flags = (uint32_t) strtoul(ITEM_suffix(old_it), (char **)NULL, 10);
                 } else if (old_it->nsuffix > 0) {
                     flags = *((uint32_t *)ITEM_suffix(old_it));
@@ -272,7 +382,7 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
                 do_item_link(it, hv);
             }
 
-            c->cas == ITEM_get_cas(it);
+            c->cas = ITEM_get_cas(it);
 
             stored = STORED;
         }
@@ -293,9 +403,13 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 }
 
 int main (int argc, char **argv) {
+    bool preallocate = true;
     int retval = EXIT_SUCCESS;
 
     bool start_assoc_maint = true;
+
+    uint32_t slab_sizes[MAX_NUMBER_OF_SLAB_CLASSES];
+    bool use_slab_sizes = false;
 
 #ifdef EXTSTORE 
     void *storage = NULL;
