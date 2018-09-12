@@ -102,7 +102,7 @@ static unsigned int temp_lru_size(int slabs_clsid) {
 // Enable this for reference-count debugging
 #if 1
 #define DEBUG_REFCNT(it,op) \
-                fprintf(stderr, "item %x refcnt(%c) %d %c%c%c\n", \
+                fprintf(stderr, "item %x refcnt(%c) %d %c%c\n", \
                     it, op, it->refcount, \
                     (it->it_flags & ITEM_LINKED) ? 'L' : ' ', \
                     (it->it_flags & ITEM_SLABBED) ? 'S': ' ')

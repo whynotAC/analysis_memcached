@@ -12,6 +12,7 @@
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
+#include <iostream>
 
 #include "trace.h"
 
@@ -266,4 +267,12 @@ void stop_assoc_maintenance_thread() {
 
     // Wait for the maintenance thread to stop
     pthread_join(maintenance_tid, NULL);
+}
+
+void displayhashtable() {
+    std::cout << "hash table start" << std::endl;
+    std::cout << "hash table size: " << hashsize(hashpower) << std::endl;
+    std::cout << "hash table memory size: " << sizeof(void *)*hashsize(hashpower)/(1024) 
+              << "KB" << std::endl;
+    std::cout << "hash table end" << std::endl;
 }
