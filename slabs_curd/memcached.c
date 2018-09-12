@@ -1,5 +1,9 @@
 #include "memcached.h"
 
+#include <string>
+#include <iomanip>
+#include <iostream>
+
 #include "util.h"
 #include "trace.h"
 #include "items.h"
@@ -14,6 +18,11 @@ extern enum hashfunc_type {
     MURMUR3_HASH
 };
 extern int hash_init(enum hashfunc_type type);
+extern void displayslabs();
+extern void displayhashtable();
+extern item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
+extern int item_link(item *item);
+extern void item_remove(item *item);
 
 static void settings_init(void) {
     settings.use_cas = true;
@@ -402,6 +411,43 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
     return stored;
 }
 
+static void displayItem(item *it) {
+    std::cout << "item next: " << it->next << std::endl;
+    std::cout << "item prev: " << it->prev << std::endl;
+    std::cout << "item h_next: " << it->h_next << std::endl;
+    std::cout << "item time: " << it->time << std::endl;
+    std::cout << "item exptime: " << it->exptime << std::endl;
+    std::cout << "item nbytes: " << it->nbytes << std::endl;
+    std::cout << "item refcount: " << it->refcount << std::endl;
+    std::string flags = "";
+    if (it->it_flags & ITEM_LINKED) {
+        flags += "ITEM_LINKED|";
+    }
+    if (it->it_flags & ITEM_CAS) {
+        flags += "ITEM_CAS|";
+    }
+    if (it->it_flags & ITEM_SLABBED) {
+        flags += "ITEM_SLABBED|";
+    }
+    if (it->it_flags & ITEM_FETCHED) {
+        flags += "ITEM_FETCHED|";
+    }
+    if (it->it_flags & ITEM_ACTIVE) {
+        flags += "ITEM_ACTIVE|";
+    }
+    if (it->it_flags & ITEM_CHUNKED) {
+        flags += "ITEM_CHUNKED|";
+    }
+    if (it->it_flags & ITEM_CHUNK) {
+        flags += "ITEM_CHUNK|";
+    }
+    std::cout << "item flags: " << flags << std::endl;
+    std::cout << "item nsuffix: " << std::hex << (uint32_t)it->nsuffix << std::endl;
+    std::cout << "item clsid: " << std::hex << (uint32_t)it->slabs_clsid << std::endl;
+    std::cout << "item nkey: " << std::hex << (uint32_t)it->nkey << std::dec << std::endl;
+    std::cout << "item data: " << it->data << std::endl;
+}
+
 int main (int argc, char **argv) {
     bool preallocate = true;
     int retval = EXIT_SUCCESS;
@@ -441,6 +487,30 @@ int main (int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+    // display code start
+    displayMemory();
+    displayslabs();
+    displayhashtable();
+    // display code end
+    
+    // curd code start
+    std::cout << std::endl;
+    auto it = item_alloc("memcached", sizeof("memcached"), 0, 1536681392, 16);
+    displayItem(it);
+    std::cout << item_link(it) << std::endl << std::endl;
+    displayItem(it);
+    item_remove(it);
+    std::cout << std::endl;
+    displayItem(it);
+    std::cout << std::endl;
+    // curd code end
+
+    // display code start
+    displayMemory();
+    displayslabs();
+    displayhashtable();
+    // display code end
+    
     stop_assoc_maintenance_thread();
 
     return retval;

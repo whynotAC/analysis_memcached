@@ -33,3 +33,6 @@ enum reassign_result_type {
 };
 
 enum reassign_result_type slabs_reassign(int src, int dst);
+
+void displayslabs();
+void displayMemory();

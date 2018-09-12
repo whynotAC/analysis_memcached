@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <assert.h>
 #include <pthread.h>
+#include <iostream>
 
 #include "trace.h"
 #include "memcached.h"
@@ -526,4 +527,25 @@ enum reassign_result_type slabs_reassign(int src, int dst) {
     ret = do_slabs_reassign(src, dst);
     pthread_mutex_unlock(&slabs_rebalance_lock);
     return ret;
+}
+
+void displayMemory() {
+    std::cout << "memory init start" << std::endl;
+    std::cout << "memory mem_limit: " << mem_limit/(1024*1024) << "MB" << std::endl;
+    std::cout << "memory mem_mallocaed: " << mem_malloced/(1024*1024) << "MB" << std::endl;
+    std::cout << "memory mem_avail: " << mem_avail/(1024*1024) << "MB" << std::endl;
+    std::cout << "memory init end" << std::endl;
+}
+
+void displayslabs() {
+    std::cout << "slabs init start" << std::endl;
+    for (int index = POWER_SMALLEST - 1; index < power_largest; ++index) {
+        std::cout << "index: " << index << std::endl;
+        std::cout << "\tsize: " << slabclass[index].size << std::endl;
+        std::cout << "\tpreslab: " << slabclass[index].perslab << std::endl;
+        std::cout << "\tsl_curr: " << slabclass[index].sl_curr << std::endl;
+        std::cout << "\tslabs: " << slabclass[index].slabs << std::endl;
+        std::cout << "\tlist_size: " << slabclass[index].list_size << std::endl;
+    }
+    std::cout << "slabs init end" << std::endl;
 }
