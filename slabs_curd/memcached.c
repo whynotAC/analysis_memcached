@@ -3,6 +3,7 @@
 #include <string>
 #include <iomanip>
 #include <iostream>
+#include <cstdlib>
 
 #include "util.h"
 #include "trace.h"
@@ -23,11 +24,41 @@ extern void displayhashtable();
 extern item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
 extern int item_link(item *item);
 extern void item_remove(item *item);
+extern void item_unlink(item *item);
+extern item* item_get(const char *key, const size_t nkey, conn *c, const bool do_update);
+
+conn **conns;
+
+// file scope variables
+static int max_fds;
+
+/**
+ * Initializes the connections array. We don't actually allocate connection
+ * structures until they're needed, so as to avoid wasting memory when the
+ * maximum connection count is much higher than the actual number of 
+ * connections.
+ *
+ * This does end up wasting a few pointers' worth of memory for FDs that are
+ * used for things other than connections, but that's worth it in exchange for
+ * being able to directly index the conns array by FD.
+ */
+static void conn_init(void) {
+    int headroom = 10;    // account for extra unexpected open FDs
+    
+    max_fds = settings.maxconns + headroom;
+
+    if ((conns = (conn **)calloc(max_fds, sizeof(conn *))) == NULL) {
+        std::cout << "Failed to allocate connection structures" << std::endl;
+        // This is unrecoverable so bail out early
+        exit(1);
+    }
+}
 
 static void settings_init(void) {
     settings.use_cas = true;
     
     settings.maxbytes = 64 * 1024 * 1024; // default is 64MB
+    settings.maxconns = 1024; // to limit connections-related memory to about 5MB
     settings.verbose = 0;
     settings.evict_to_free = 1;     // push old items out of cache when memory runs out
     settings.factor = 1.25;
@@ -412,6 +443,9 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
 }
 
 static void displayItem(item *it) {
+    if (it == NULL) {
+        return;
+    }
     std::cout << "item next: " << it->next << std::endl;
     std::cout << "item prev: " << it->prev << std::endl;
     std::cout << "item h_next: " << it->h_next << std::endl;
@@ -474,6 +508,7 @@ int main (int argc, char **argv) {
 
     // initialize other stuff
     assoc_init(settings.hashpower_init);
+    conn_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate,
                 use_slab_sizes ? slab_sizes : NULL);
 
@@ -497,12 +532,21 @@ int main (int argc, char **argv) {
     std::cout << std::endl;
     auto it = item_alloc("memcached", sizeof("memcached"), 0, 1536681392, 16);
     displayItem(it);
+    auto getItem = item_get("memcached", sizeof("memcached"), conns[0], false);
+    if (getItem == NULL) {
+        std::cout << "get item is null" << std::endl;
+    } else {
+        displayItem(it);
+    }
     std::cout << item_link(it) << std::endl << std::endl;
     displayItem(it);
     item_remove(it);
     std::cout << std::endl;
     displayItem(it);
     std::cout << std::endl;
+    item_unlink(it);
+    std::cout << std::endl;
+    displayItem(it);
     // curd code end
 
     // display code start

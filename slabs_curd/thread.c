@@ -25,6 +25,12 @@ unsigned int item_lock_hashpower;
 #define hashsize(n) ((unsigned long int)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
+/**
+ * Each libevent instance has a wakeup pipe, which other threads
+ * can use to signal that they've put a new connection on this queue
+ */
+static LIBEVENT_THREAD *threads;
+
 /*  item_lock() must be held for an item before any modifications to either its
  *  associated hash bucket,or the structure itself.
  *  LRU modifications must hold the item lock, and the LRU lock.
@@ -73,6 +79,35 @@ void pause_threads(enum pause_thread_types type) {
     }
 
     return;
+}
+
+/************************************* LIBEVENT THREADS ***********************/
+
+/**
+ * Set up a thread's information
+ */
+static void setup_thread(LIBEVENT_THREAD *me) {
+    
+    if (pthread_mutex_init(&me->stats.mutex, NULL) != 0) {
+        perror("Failed to initialize mutex");
+        exit(EXIT_FAILURE);
+    }
+}
+
+/**
+ * Worker thread: main event loop
+ */
+static void *worker_libevent(void *arg) {
+    LIBEVENT_THREAD *me = (LIBEVENT_THREAD*)arg;
+
+    /**
+     * Any per-thread setup can happen here; memcached_thread_init() will block
+     * until all threads have finished initializing.
+     */
+    me->lru_bump_buf = item_lru_bump_buf_create();
+    if (me->lru_bump_buf == NULL) {
+        abort();
+    }
 }
 
 /************************************* ITEM ACCESS ****************************/
@@ -208,6 +243,10 @@ void memcached_thread_init(int nthreads, void *arg) {
     int i;
     int power;
 
+    for (i = 0; i < POWER_LARGEST; ++i) {
+        pthread_mutex_init(&lru_locks[i], NULL);
+    }
+
     /*
      * Want a wide lock table, but don't wate memory
      */
@@ -243,5 +282,22 @@ void memcached_thread_init(int nthreads, void *arg) {
     }
     for (i = 0; i < item_lock_count; ++i) {
         pthread_mutex_init(&item_locks[i], NULL);
+    }
+
+    threads = (LIBEVENT_THREAD *)calloc(nthreads, sizeof(LIBEVENT_THREAD));
+    if (! threads) {
+        perror("Can't allocate thread descriptors");
+        exit(1);
+    }
+
+    for (i = 0; i < nthreads; ++i) {
+        setup_thread(&threads[i]);
+        // Reserve three fds for the libevent base, and two for the pipe
+        stats_state.reserved_fds += 5;
+    }
+
+    // Create threads after  we've done all the lievent setup
+    for (i = 0; i < nthreads; ++i) {
+        worker_libevent(&threads[i]);
     }
 }
