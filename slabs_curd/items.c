@@ -855,6 +855,38 @@ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
     return it;
 }
 
+// TODO: Third place this code needs to be deduped
+static void lru_bump_buf_link_q(lru_bump_buf *b) {
+    pthread_mutex_lock(&bump_buf_lock);
+    assert(b != bump_buf_head);
+
+    b->prev = 0;
+    b->next = bump_buf_head;
+    if (b->next) b->next->prev = b;
+    bump_buf_head = b;
+    if (bump_buf_tail == 0) bump_buf_tail = b;
+    pthread_mutex_unlock(&bump_buf_lock);
+    return;
+}
+
+void *item_lru_bump_buf_create(void) {
+    lru_bump_buf *b = (lru_bump_buf *)calloc(1, sizeof(lru_bump_buf));
+    if (b == NULL) {
+        return NULL;
+    }
+
+    b->buf = bipbuf_new(sizeof(lru_bump_entry) * LRU_BUMP_BUF_SIZE);
+    if (b->buf == NULL) {
+        free(b);
+        return NULL;
+    }
+
+    pthread_mutex_init(&b->mutex, NULL);
+
+    lru_bump_buf_link_q(b);
+    return b;
+}
+
 static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
     bool ret = false;
     refcount_incr(it);

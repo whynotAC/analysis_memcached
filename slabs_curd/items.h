@@ -37,6 +37,8 @@ int do_item_replace(item *it, item *new_it, const uint32_t hv);
 
 int item_is_flushed(item *it);
 
+void *item_lru_bump_buf_create(void);
+
 #define LRU_PULL_EVICT 1
 #define LRU_PULL_CRAWL_BLOCKS 2
 #define LRU_PULL_RETURN_ITEM 4

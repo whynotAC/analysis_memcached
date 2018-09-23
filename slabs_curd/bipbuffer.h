@@ -15,6 +15,15 @@ typedef struct {
     unsigned char data[];
 } bipbuf_t;
 
+/***
+ * Create a new bip buffer.
+ *
+ * malloc()s space
+ *
+ * @param[in] size The size of the buffer
+ */
+bipbuf_t *bipbuf_new(const unsigned int size);
+
 // TODO: DOCUMENTATION
 unsigned char *bipbuf_request(bipbuf_t *me, const int size);
 int bipbuf_push(bipbuf_t *me, const int size);

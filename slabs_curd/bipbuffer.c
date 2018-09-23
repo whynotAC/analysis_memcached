@@ -1,5 +1,12 @@
 #include "bipbuffer.h"
 
+#include <cstring>
+#include <stdlib.h>
+
+static size_t bipbuf_sizeof(const unsigned int size) {
+    return sizeof(bipbuf_t) + size;
+}
+
 int bipbuf_unused(const bipbuf_t *me) {
     if (1 == me->b_inuse) {
         // distance between region B and region A
@@ -7,6 +14,20 @@ int bipbuf_unused(const bipbuf_t *me) {
     } else {
         return me->size - me->a_end;
     }
+}
+
+void bipbuf_init(bipbuf_t *me, const unsigned int size) {
+    me->a_start = me->a_end = me->b_end = 0;
+    me->size = size;
+    me->b_inuse = 0;
+}
+
+bipbuf_t *bipbuf_new(const unsigned int size) {
+    bipbuf_t *me = (bipbuf_t *)malloc(bipbuf_sizeof(size));
+    if (!me)
+        return NULL;
+    bipbuf_init(me, size);
+    return me;
 }
 
 static void __check_for_switch_to_b(bipbuf_t *me) {
