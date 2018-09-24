@@ -532,6 +532,9 @@ int main (int argc, char **argv) {
     std::cout << std::endl;
     auto it = item_alloc("memcached", sizeof("memcached"), 0, 1536681392, 16);
     displayItem(it);
+    std::cout << "=========================" << std::endl;
+    auto bigIt = item_alloc("kjkljkjkjkljkljkl", sizeof("kjkljkjkjkljkljkl"), 0, 1536681392, 1024*1024/2+1);
+    displayItem(bigIt);
     auto getItem = item_get("memcached", sizeof("memcached"), conns[0], false);
     if (getItem == NULL) {
         std::cout << "get item is null" << std::endl;
@@ -540,6 +543,9 @@ int main (int argc, char **argv) {
     }
     std::cout << item_link(it) << std::endl << std::endl;
     displayItem(it);
+    std::cout << "=========================" << item_link(bigIt) << std::endl << std::endl;
+    displayItem(bigIt);
+    std::cout << "========================" << std::endl;
     item_remove(it);
     std::cout << std::endl;
     displayItem(it);

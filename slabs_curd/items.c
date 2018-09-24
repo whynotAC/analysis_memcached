@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <pthread.h>
+#include <iostream>
 
 #include "assoc.h"
 #include "trace.h"
@@ -480,7 +481,9 @@ item *do_item_alloc(char *key, const size_t nkey, const unsigned int flags,
         if (settings.use_cas) {
             htotal += sizeof(uint64_t);
         }
+        std::cout << "size: " << htotal << std::endl;
         hdr_id = slabs_clsid(htotal);
+        std::cout << "size: " << htotal << "\thdr_id: " << hdr_id << std::endl;
         it = do_item_alloc_pull(htotal, hdr_id);
         /* setting ITEM_CHUNKED is fine here because we aren't LINKED yet.*/
         if (it != NULL)
@@ -559,7 +562,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
     if (id == 0)
         return 0;
 
-    int tries = 0;
+    int tries = 5;
     item *search;
     item *next_it;
     void *hold_lock = NULL;
