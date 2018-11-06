@@ -522,7 +522,123 @@ static void do_slabs_stats(ADD_STAT add_stats, void *c) {
 }
 
 static void *memory_allocate(size_t size) {
+    void *ret;
 
+    if (mem_base == NULL) {
+        // We are not using a preallocated large memory chunk
+        ret = malloc(size);
+    } else {
+        ret = mem_current;
+
+        if (size > mem_avail) {
+            return NULL;
+        }
+
+        // mem_current pointer _must_ be aligned!!!
+        if (size % CHUNK_ALIGN_BYTES) {
+            size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
+        }
+
+        mem_current = ((char*)mem_current) + size;
+        if (size < mem_avail) {
+            mem_avail -= size;
+        } else {
+            mem_avail = 0;
+        }
+    }
+    mem_malloced += size;
+
+    return ret;
 }
+
+// Must only be used if all pages are item_size_max
+static void memory_release() {
+    void *p = NULL;
+    if (mem_base != NULL)
+        return;
+
+    if (!settings.slab_reassign)
+        return;
+
+    while (mem_malloced > mem_limit && 
+            (p = get_page_from_global_pool()) != NULL) {
+        free(p);
+        mem_malloced -= settings.slab_page_size;
+    }
+}
+
+void *slabs_alloc(size_t size, unsigned int id, uint64_t *total_bytes,
+        unsigned int flags) {
+    void *ret;
+
+    pthread_mutex_lock(&slab_lock);
+    ret = do_slabs_alloc(size, id, total_bytes, flags);
+    pthread_mutex_unlock(&slab_lock);
+    return ret;
+}
+
+void slabs_free(void *ptr, size_t size, unsigned int id) {
+    pthread_mutex_lock(&slab_lock);
+    do_slabs_free(ptr, size, id);
+    pthread_mutex_unlock(&slab_lock);
+}
+
+static bool do_slabs_adjust_mem_limit(size_t new_mem_limit) {
+    // Cannot adjust memory limit at runtime if prealloc'ed
+    if (mem_base != NULL)
+        return false;
+    settings.maxbytes = new_mem_limit;
+    mem_limit = new_mem_limit;
+    mem_limit_reached = false;
+    memory_release();
+    return true;
+}
+
+bool slabs_adjust_mem_limit(size_t new_mem_limit) {
+    bool ret;
+    pthread_mutex_lock(&slabs_lock);
+    ret = do_slabs_adjust_mem_limit(new_mem_limit);
+    pthread_mutex_unlock(&slabs_lock);
+    return ret;
+}
+
+void slabs_adjust_mem_requested(unsigned int id, size_t old, size_t ntotal) {
+    pthread_mutex_lock(&slabs_lock);
+    slabclass_t *p;
+    if (id < POWER_SMALLEST || id > power_largest) {
+        fprintf(stderr, "Internal error! Invalid slab class\n");
+        abort();
+    }
+
+    p = &slabclass[id];
+    p->requested = p->requested - old + ntotal;
+    pthread_mutex_unlock(&slabs_lock);
+}
+
+unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
+            uint64_t *total_bytes, unsigned int *chunks_perslab) {
+    unsigned int ret;
+    slabclass_t *p;
+
+    pthread_mutex_lock(&slabs_lock);
+    p = &slabclass[id];
+    ret = p->sl_curr;
+    if (mem_flag != NULL) 
+        *mem_flag = mem_malloced >= mem_limit ? true : false;
+    if (tatal_bytes != NULL)
+        *total_bytes = p->requested;
+    if (chunks_perslab != NULL)
+        *chunks_perslab = p->perslab;
+    pthread_mutex_unlock(&slabs_lock);
+    return ret;
+}
+
+/**
+ * The slabber system could avoid needing to understand much, if anything,
+ * about items if callbacks were strategically used. Due to how the slab mover
+ * works, certain flag bits can only be adjusted while holding the slabs lock.
+ * Using these functions, isolate sections of code needing this and turn them
+ * into callbacks when an iterface becomes more abvious.
+ */
 
 #endif
