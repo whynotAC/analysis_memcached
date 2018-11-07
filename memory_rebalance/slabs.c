@@ -640,5 +640,75 @@ unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
  * Using these functions, isolate sections of code needing this and turn them
  * into callbacks when an iterface becomes more abvious.
  */
+void slab_mlock(void) {
+    pthread_mutex_lock(&slabs_lock);
+}
+
+void slab_munlock(void) {
+    pthread_mutex_unlock(&slabs_lock);
+}
+
+static pthread_cond_t slab_rebalance_cond = PTHREAD_COND_INITIALIZER;
+static volatile int do_run_slab_thread = 1;
+static volatile int do_run_slab_rebalance_thread = 1;
+
+#define DEFAULT_SLAB_BULK_CHECK 1
+int slab_bulk_check = DEFAULT_SLAB_BULK_CHECK;
+
+static int slab_rebalance_start(void) {
+    slabclass_t *s_cls;
+    int no_go = 0;
+
+    pthread_mutex_lock(&slabs_lock);
+
+    if (slab_rebal.s_clsid < SLAB_GLOBAL_PAGE_POOL ||
+        slab_rebal.s_clsid > power_largest ||
+        slab_rebal.d_clsid < SLAB_GLOBAL_PAGE_POOL || 
+        slab_rebal.d_clsid > power_largest ||
+        slab_rebal.s_clsid == slab_rebal.d_clsid)
+      no_go = -2;
+
+    s_cls = &slabclass[slab_rebal.s_clsid];
+
+    if (!grow_slab_list(slab_rebal.d_clsid)) {
+        no_go = -1;
+    }
+
+    if (s_cls->slabs < 2)
+        no_go = -3;
+
+    if (no_go != 0) {
+        pthread_mutex_unlock(&slabs_lock);
+        return no_go;   // Should use a wrapper function
+    }
+
+    /*
+     * Always kill the first available slab page as it is most likely to
+     * contain the oldest items.
+     */
+    slab_rebal.slab_start = s_cls->slab_list[0];
+    slab_rebal.slab_end = (char *)slab_rebal.slab_start + 
+        (s_cls->size * s_cls->perslab);
+    slab_rebal.slab_pos = slab_rebal.slab_start;
+    slab_rebal.done = 0;
+    // Don't need to do chunk move work if page is in global pool
+    if (slab_rebal.s_clsid == SLAB_GLOBAL_PAGE_POOL) {
+        slab_rebal.done = 1;
+    }
+
+    slab_rebalance_signal = 2;
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "Started a slab rebalance\n");
+    }
+
+    pthread_mutex_unlock(&slab_lock);
+
+    STATS_LOCK();
+    stats_state.slab_reassign_running = true;
+    STATS_UNLOCK();
+
+    return 0;
+}
 
 #endif
