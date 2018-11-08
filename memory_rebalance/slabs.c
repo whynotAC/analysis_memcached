@@ -711,4 +711,124 @@ static int slab_rebalance_start(void) {
     return 0;
 }
 
+// CALLED WITH slabs_lock HELD
+static void *slab_rebalance_alloc(const size_t size, unsigned int id) {
+    slabclass_t *s_cls;
+    s_cls = &slabclass[slab_rebal.s_clsid];
+    int x;
+    item *new_it = NULL;
+
+    for (x = 0; x < s_cls->perslab; x++) {
+        new_it = do_slabs_alloc(size, id, NULL, SLABS_ALLOC_NO_NEWPAGE);
+        // check that memory isn't within the range to clear
+        if (new_it == NULL) {
+            break;
+        }
+        if ((void *)new_it >= slab_reabal.slab_start 
+            && (void *)new_it < slab_rebal.slab_end) {
+            /* Pulled something we intend to free. Mark it as freed since
+             * we've already done the work of unlinking it from the freelist.
+             */
+            s_cls->requested -= size;
+            new_it->refcount = 0;
+            new_it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+#ifdef DEBUG_SLAB_MOVER
+            memcpy(ITEM_key(new_it), "deadbeef", 8);
+#endif
+            new_it = NULL;
+            slab_rebal.inline_reclaim++;
+        } else {
+            break;
+        }
+    }
+    return new_it;
+}
+
+// CALLED WITH slabs_lock HEAD
+// detaches item/chunk from freelist
+static void slab_rebalance_cut_free(slabclass_t *s_cls, item *it) {
+    // Ensure this was on the freelist and nothing else
+    assert(it->it_flags == ITEM_SLABBED);
+    if (s_cls->slots == it) {
+        s_cls->slots = it->next;
+    }
+    if (it->next) it->next->prev = it->prev;
+    if (it->prev) it->prev->next = it->next;
+    s_cls->sl_curr--;
+}
+
+enum move_status {
+    MOVE_PASS=0, MOVE_FROM_SLAB, MOVE_FROM_LRU, MOVE_BUSY, MOVE_LOCKED
+};
+
+#define SLAB_MOVE_MAX_LOOPS 1000
+
+/*
+ * refcount == 0 is safe since nobody can incr while item_lock is held.
+ * refcount != 0 is impossible since flags/etc can be modified in other
+ * threads. instead, note we found a busy one and bail. logic in do_item_get
+ * will prevent busy items from continuing to be busy
+ * NOTE: This is checking it_flags outside of an item lock. I believe this
+ * works since it_flags is 8 bit, and we're only ever comparing a single bit
+ * regardless. ITEM_SLABBED bit will always be correct since we're holding the
+ * lock which modifies that bit. ITEM_LINKED won't exist if we're between an 
+ * item having ITEM_SLABBED removed, and the key hasn't been added to the item
+ * yet. The memory barrier from the slabs lock should order the key write and the
+ * flags to the item?
+ * if ITEM_LINKED did exist and was just removed, but we still see it, that's
+ * still safe since it will have a vaild key, which we then lock, and then
+ * recheck everything.
+ * This may not be safe on all platforms; if not, slabs_alloc() will need to
+ * seed the item key while holding slabs_lock.
+ */
+static int slab_rebalance_move(void) {
+    slabclass_t *s_cls;
+    int x;
+    int was_busy = 0;
+    int refcount = 0;
+    uint32_t hv;
+    void *hold_lock;
+    enum move_status status = MOVE_PASS;
+
+    pthread_mutex_lock(&slabs_lock);
+
+    for (x = 0; x < slab_bulk_check; x++) {
+        hv = 0;
+        hold_lock = NULL;
+        item *it = slab_rebal.slab_pos;
+        item_chunk *ch = NULL;
+        status = MOVE_PASS;
+        if (it->it_flags & ITEM_CHUNK) {
+            // This chunk is a chained part of a larger item.
+            ch = (item_chunk *)it;
+            /* Instead, we use the head chunk to find the item and effectively
+             * lock the entire structure. if a chunk has ITEM_CHUNK flag, its
+             * head cannot be slabbed, so the normal routine is safe.
+             */
+            it = ch->head;
+            assert(it->it_flags & ITEM_CHUNKED);
+        }
+
+        /* ITEM_FETCHED when ITEM_SLABBED is overloaded to mean we've cleared
+         * the chunk for move. Only these two flags should exist.
+         */
+        if (it->it_flags != (ITEM_SLABBED|ITEM_FETCHED)) {
+            // ITEM_SLABBED can only be added/removed under the slabs_lock
+            if (it->it_flags & ITEM_SLABBED) {
+                assert(ch == NULL);
+                slab_rebalance_cut_free(s_cls, it);
+                status = MOVE_FROM_SLAB;
+            } else if ((it->it_flags & ITEM_LINKED) != 0) {
+                /* If it doesn't have ITEM_SLABBED, the item could be in any
+                 * state on its way to being freed or written to. If no
+                 * ITEM_SLABBED, but it's had ITEM_LINKED, it must be active
+                 * and have the key written to it already.
+                 */
+                hv = hash(ITEM_key(it), it->nkey);
+                if ((hold_lock) = item_trylock(hv) == NULL) {
+                }
+            }
+        }
+    }
+}
 #endif
