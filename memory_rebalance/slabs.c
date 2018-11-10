@@ -826,9 +826,59 @@ static int slab_rebalance_move(void) {
                  */
                 hv = hash(ITEM_key(it), it->nkey);
                 if ((hold_lock) = item_trylock(hv) == NULL) {
+                    status = MOVE_LOCKED;
+                } else {
+                    bool is_linked = (it->it_flags & ITEM_LINKED);
+                    refcount = refcount_incr(it);
+                    if (refcount == 2) { // item is linked but not busy
+                        //Double check ITEM_LINKED flag here, since we're
+                        //past a memory barrier from the mutex.
+                        if (is_linked) {
+                            status = MOVE_FROM_LRU;
+                        } else {
+                            /* refcount == 1 + !ITEM_LINKED means the item is
+                             * being uploaded to, or was just unlinked but
+                             * hasn't been freed yet. Let it bleed off on its
+                             * own and try again later.
+                             */
+                            status = MOVE_BUSY;
+                        }
+                    } else if (refcount > 2 && is_linked) {
+                        // TODO: Mark items for delete/rescue and process
+                        // outside of the main loop
+                        if (slab_rebal.busy_loops > SLAB_MOVE_MAX_LOOPS) {
+                            slab_rebal.busy_deletes++;
+                            // Only safe to hold slabs lock because refcount
+                            // can't drop to 0 util we release item lock
+                            STORAGE_delete(storage, it);
+                            pthread_mutex_unlock(&slab_lock);
+                            do_item_unlink(it, hv);
+                            pthread_mutex_lock(&slab_lock);
+                        }
+                        status = MOVE_BUSY;
+                    } else {
+                        if (settings.verbose > 2) {
+                            fprintf(stderr, "Slab reassign hit a busy item: refcount: %d (%d -> %d)\n",
+                                it->refcount, slab_rebal.s_clsid, slab_rebal.d_clsid);
+                        }
+                        status = MOVE_BUSY;
+                    }
+                    /* Item lock must be held while modifying refcount */
+                    if (status == MOVE_BUSY) {
+                        refcount_decr(it);
+                        item_trylock_unlock(hold_lock);
+                    }
                 }
+            } else {
+                /* See above comment. NO ITEM_SLABBED or ITEM_LINKED. Mark
+                 * busy and wait for item to complete its upload */
+                status = MOVE_BUSY;
             }
         }
+
+        int save_item = 0;
+        item *new_it = NULL;
+
     }
 }
 #endif
