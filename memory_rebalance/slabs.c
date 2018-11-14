@@ -451,9 +451,9 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
             APPEND_STAT("curr_items", "%llu", (unsigned long long)stats_state.curr_items);
             APPEND_STAT("total_items", "%llu", (unsigned long long)stat.total_items);
             STATS_UNLOCK();
-            pthread_mutex_lock(&slab_lock);
+            pthread_mutex_lock(&slabs_lock);
             APPEND_STAT("slab_global_page_pool", "%u", slabclass[SLAB_GLOBAL_PAGE_POOL].slabs);
-            pthread_mutex_unlock(&slab_lock);
+            pthread_mutex_unlock(&slabs_lock);
             item_stats_totals(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "items") == 0) {
             item_stats(add_stats, c);
@@ -571,16 +571,22 @@ void *slabs_alloc(size_t size, unsigned int id, uint64_t *total_bytes,
         unsigned int flags) {
     void *ret;
 
-    pthread_mutex_lock(&slab_lock);
+    pthread_mutex_lock(&slabs_lock);
     ret = do_slabs_alloc(size, id, total_bytes, flags);
-    pthread_mutex_unlock(&slab_lock);
+    pthread_mutex_unlock(&slabs_lock);
     return ret;
 }
 
 void slabs_free(void *ptr, size_t size, unsigned int id) {
-    pthread_mutex_lock(&slab_lock);
+    pthread_mutex_lock(&slabs_lock);
     do_slabs_free(ptr, size, id);
-    pthread_mutex_unlock(&slab_lock);
+    pthread_mutex_unlock(&slabs_lock);
+}
+
+void slabs_stats(ADD_STAT add_stats, void *c) {
+    pthread_mutex_lock(&slabs_lock);
+    do_slabs_stats(add_stats, c);
+    pthread_mutex_unlock(&slabs_lock);
 }
 
 static bool do_slabs_adjust_mem_limit(size_t new_mem_limit) {
@@ -640,11 +646,11 @@ unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
  * Using these functions, isolate sections of code needing this and turn them
  * into callbacks when an iterface becomes more abvious.
  */
-void slab_mlock(void) {
+void slabs_mlock(void) {
     pthread_mutex_lock(&slabs_lock);
 }
 
-void slab_munlock(void) {
+void slabs_munlock(void) {
     pthread_mutex_unlock(&slabs_lock);
 }
 
@@ -702,7 +708,7 @@ static int slab_rebalance_start(void) {
         fprintf(stderr, "Started a slab rebalance\n");
     }
 
-    pthread_mutex_unlock(&slab_lock);
+    pthread_mutex_unlock(&slabs_lock);
 
     STATS_LOCK();
     stats_state.slab_reassign_running = true;
@@ -851,9 +857,9 @@ static int slab_rebalance_move(void) {
                             // Only safe to hold slabs lock because refcount
                             // can't drop to 0 util we release item lock
                             STORAGE_delete(storage, it);
-                            pthread_mutex_unlock(&slab_lock);
+                            pthread_mutex_unlock(&slabs_lock);
                             do_item_unlink(it, hv);
-                            pthread_mutex_lock(&slab_lock);
+                            pthread_mutex_lock(&slabs_lock);
                         }
                         status = MOVE_BUSY;
                     } else {
