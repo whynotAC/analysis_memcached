@@ -1,4 +1,8 @@
-#1 slab文件中对外接口函数
+slabs文件分析
+===========================
+
+1 slabs文件中对外接口函数
+----------------------------
 
 | 函数名	|	函数定义	|	作用	|	备注  |
 | ---- 	| ----- 	| ---- 	| ----- 	  |
@@ -21,3 +25,55 @@
 | `slabs_reassign` | `enum reassign_result_type slabs_reassign(int src, int dst)` | 调整`id`为`src/dst`的`slabclass`的函数 | 其会抢占`slabs_rebalance_lock`锁 | 
 | `slabs_rebalancer_pause` | `void slabs_rebalancer_pause(void)` | 暂停`slabclass`调整线程 | 无 | 
 | `slabs_rebalancer_resume` | `void slabs_rebalancer_resume(void)` | 恢复`slabclass`调整线程运行 | 无 | 
+
+2 slabs文件中全局变量
+---------------------------
+**slabs文件中重要结构体**
+
+>		// powers-of-N allocation structures
+>		typedef struct {
+>			unsigned int size;		//	sizeof of items
+>			unsigned int perslab;	// 	how many items per slab
+>			
+>			void *slots;				// list of items ptrs
+>			unsigned int sl_curr;	//	total free items in list
+>
+>			unsigned int slabs;		//	how many slabs were allocated for this class
+>			
+>			void **slab_list;		//	array of slab pointers
+>			unsigned int list_size;	//	size of prev array
+>
+>			size_t requested;		//	The number of requested bytes
+>		} slabclass_t;
+>
+>		#define DEFAULT_SLAB_BULK_CHECK 1
+>
+>		enum move_status {
+>			MOVE_PASS=0, MOVE_FROM_SLAB, MOVE_FROM_LRU, MOVE_BUSY, MOVE_LOCKED
+>		};
+>
+>		#define SLAB_MOVE_MAX_LOOPS 1000
+
+**slabs文件中全局变量**
+
+|	变量名	|	定义	|	是否为静态变量	|	作用    |  备注   |
+| ------- | ------- | ------------- | --------- | ------ |
+| `slabclass` | `slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES]` | 是 | 用于存放所有`slabclass`，管理内存空间 | 无 |
+| `mem_limit` | `size_t mem_limit = 0` | 是 | 用于记录整个内存空间的大小 | 无 |
+| `mem_malloced` | `size_t mem_malloced = 0` | 是 | 用于记录已用内存空间的大小 |无|
+| `mem_limit_reached` | `bool mem_limit_reached = false` | 是 | 用于标记已用内存是否超过`mem_limit`的值 | 无 |
+| `power_largest` | `int power_largest` | 是 | 用于记录最大的`slabclass`的下标|无|
+| `mem_base` | `void *mem_base = NULL` | 是 | 用于指向分配内存空间的基地址 | 无 |
+| `mem_current` | `void *mem_current = NULL` | 是 | 用于记录当前可分配空间的开始地址| 无 |
+| `mem_avail` | `size_t mem_avail = 0` | 是 | 用于记录已分配空间的大小 | 无 |
+| `slabs_lock` | `pthread_mutex_t slabs_lock = PTHREAD_MUTEX_INITIALIZER` |是| 用于控制访问`slabclass`的互斥量 | 无 |
+| `slabs_rebalance_lock` | `pthread_mutex_t slabs_rebalance_lock = PTHREAD_MUTEX_INITIALIZER` | 是 | 用于控制`slab_rebalance_thread`线程行为的互斥量|无|
+| `slab_rebalance_cond` | `pthread_cond_t slab_rebalance_cond = PTHREAD_COND_INITIALIZER` | 是 | 用于控制`slab_rebalance_thread`线程的行为的信号量| 无 |
+| `do_run_slab_thread` | `volatile int do_run_slab_thread = 1` | 是 | 无 | 无 | 
+| `do_run_slab_rebalance_thread` | `volatile int do_run_slab_rebalance_thread = 1` | 是 | 用于控制`slab_rebalance_thread`是否停止运行 | 无 |
+| `slab_bulk_check` | `int slab_bulk_check = 1` | 否 |用于控制`slab_rebalance_thread`线程每次移动`item`的个数 | 无 |
+| `rebalance_tid` | `pthread_t rebalance_tid` | 是 | 用于记录`slab_rebalance_thread`线程的`ID` | 无 |
+
+3 slabs文件中静态函数
+-----------------------------------
+
