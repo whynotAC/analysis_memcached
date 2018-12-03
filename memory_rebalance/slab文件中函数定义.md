@@ -77,3 +77,10 @@ slabs文件分析
 3 slabs文件中静态函数
 -----------------------------------
 
+|	函数名		|	函数定义	|	作用		|  备注  |
+| --------	| --------	| ----------	| ------ |
+| `grow_slab_list` | `int grow_slab_list(const unsigned int id)` | 增加`slabclass`中的`slab_list`空间,方便添加`slab/chunk` | `slabclass`的空间按照原来的两倍进行增加 |
+| `do_slabs_newslab` | `int do_slabs_newslab(const unsigned int id)` | 为指定`id`的`slabclass`分配一个`slab/chunk`空间 | 此函数用于分配申请的内存空间 |
+| `memory_allocate` | `void *memory_allocate(size_t size)` | 从申请的内存空间中分配`size`大小的内存空间 | 此函数用于分配直接从内存申请的内存空间 |
+| `do_slabs_free` | `void do_slabs_free(void *ptr, const size_t size, unsigned int id)` | 用于释放内存空间到`id`指定的`slabclass`中 | 注意按照`item`中的`it_flags`进行分类释放内存空间 |
+| `` 
