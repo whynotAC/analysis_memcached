@@ -83,4 +83,21 @@ slabs文件分析
 | `do_slabs_newslab` | `int do_slabs_newslab(const unsigned int id)` | 为指定`id`的`slabclass`分配一个`slab/chunk`空间 | 此函数用于分配申请的内存空间 |
 | `memory_allocate` | `void *memory_allocate(size_t size)` | 从申请的内存空间中分配`size`大小的内存空间 | 此函数用于分配直接从内存申请的内存空间 |
 | `do_slabs_free` | `void do_slabs_free(void *ptr, const size_t size, unsigned int id)` | 用于释放内存空间到`id`指定的`slabclass`中 | 注意按照`item`中的`it_flags`进行分类释放内存空间 |
-| `` 
+| `slabs_preallocate` | `void slabs_preallocate(const unsigned int maxslabs)` | 给每一个`slabclass`预分配内存 | 预分配内存大小为一个`slab/chunk` |
+|`split_slab_page_into_freelist` | `void split_slab_page_into_freelist(char *ptr, const unsigned int id)` | 将申请的内存空间按照`slabclass[id]`的大小进行划分|申请的`slab/chunk`内存空间将分为`slabclass[id]`的大小，然后存放在空闲链表中 |
+| `get_page_from_global_pool` | `void *get_page_from_global_pool(void)` | 从`slabclass[SLAB_GLOBAL_PAGE_POOL]`中申请内存空间 | 无 |
+| `do_slabs_alloc` | `void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_bytes, unsigned int flags)` | 用于申请指定大小内存的`slabclass`中的`item` | 若无空闲`item`，则申请新`slab/chunk`来填充`slabclass` |
+| `do_slabs_free_chunked` | `void do_slabs_free_chunked(item *it, const size_t size)` | 用于释放`item_chunk`的内存空间 | `item`中的`it_flags`中存在`ITEM_CHUNK`标识 |
+| `nz_strcmp` | `int nz_strcmp(int nzlength, const char *nz, const char *z)` | 用于判断字符串`nz`和`z`是否相同 | 无 |
+| `do_slabs_stats` | `void do_slabs_stats(ADD_STAT add_stats, void *c)` | 用于统计`slabclass`的信息 | 无 |
+| `memory_release` | `void memory_release()` | 用于释放申请的内存空间，此函数只当`settings.slab_reassign`为`true`时使用 | 无 |
+| `do_slabs_adjust_mem_limit` | `bool do_slabs_adjust_mem_limit(size_t new_mem_limit)` | 用于动态调整申请内存空间的大小 | 只能够释放内存空间 |
+| `slab_rebalance_start` | `int slab_rebalance_start(void)` | 用于开启`slab_rebalance`线程 | 无 |
+| `slab_rebalance_alloc` | `void *slab_rebalance_alloc(const size_t size, unsigned int id)` | 用于`slab_rebalance`现场中调用 | 无 |
+| `slab_rebalance_cut_free` | `void slab_rebalance_cut_free(slabclass_t *s_cls, item *it)` | 用于将源`slabclass`中的`item`拖链 | 无 |
+| `slab_rebalance_move` | `int slab_rebalance_move(void)` | 用于将源`slabclass`中`item`进行转移 | 无 |
+| `slab_rebalance_finish` | `void slab_rebalancfinish(void)` | 用于`slab_rebalance`线程中完成时调用的函数 | 无 |
+| `slab_rebalance_thread` | `void *slab_rebalance_thread(void)` | `slab_rebalance`线程函数 | 无 |
+| `slabs_reassign_pick_any` | `int slabs_reassign_pick_any(int dst)` | 用于选择`slabclass`转移中的源空间 | 无 |
+| `do_slabs_reassign` | `enum reassign_result_type do_slabs_reassign(int src, int dst)` | 选择好源和目标的`slabclass`的`id`，然后开启内存空间的`rebalance` | 无 |
+
