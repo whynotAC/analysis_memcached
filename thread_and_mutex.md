@@ -6,7 +6,7 @@ memcached中的线程和锁
 | 文件名	|	线程函数|	作用	| 备注		|
 | 	----	|	----	|	----	|	-----	|
 | cralwer.c	|	item\_crawler\_thread|	| |
-| slabs.c	| slab\_rebalance\_thread | | |
+| slabs.c	| slab\_rebalance\_thread | 创建`slabclass`中`slab page`转移线程| |
 | thread.c | worker\_libevent | 创建工作线程 | |
 | items.c | lru\_maintainer\_thread | 创建lru管理线程 | |
 | storage.c | storage\_compact\_thread |  | |
@@ -38,7 +38,7 @@ memcached中的线程和锁
 | logger.h | mutex | | 在结构体logger |
 | memcached.h | mutex | | 在结构体thread\_stats |
 | slabs.c | slabs\_lock | 用于slabclass访问锁 | |
-| slabs.c | slabs\_rebalance\_lock |  | |
+| slabs.c | slabs\_rebalance\_lock | 用于`slabs_rebalance_thread`线程  | |
 | storage.c | storage\_compact\_plock |  | |
 | storage.c | lock |  | 在结构体storage\_compact\_wrap |
 | thread.c | lock |  | 在结构体conn\_queue |
