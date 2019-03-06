@@ -159,7 +159,9 @@ slabRebalanceThread线程
 >		return -1;
 >	}
 >```
+
 由上述代码显示可以，程序采用轮流坐庄的模式进行选择源`slabclass`。
+
 4.`slab_rebalance_thread`中调用的函数代码结构
 ------------------------------------------
 **4.1 `slab_rebalance_start`函数的代码结构**
@@ -216,6 +218,7 @@ slabRebalanceThread线程
 >		return 0;
 >	}
 >	```
+
 此函数用于判断`slab_rebalance_thread`线程所接受的`slab_rebal`结构体中的源`slabclass`和目的`slabclass`是否符合要求。
 
 **4.2 `slab_rebalance_move`函数的代码结构**
