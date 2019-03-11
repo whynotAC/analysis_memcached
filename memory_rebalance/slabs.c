@@ -1016,7 +1016,7 @@ static int slab_rebalance_move(void) {
             stats.slab_reassign_busy_items += slab_rebal.busy_items;
             STATS_UNLOCK();
             slab_rebal.busy_items = 0;
-            slab_rebal.busy_lops++;
+            slab_rebal.busy_loops++;
         } else {
             slab_rebal.done++;
         }
