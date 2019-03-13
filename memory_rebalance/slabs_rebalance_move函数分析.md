@@ -293,3 +293,6 @@ slab\_rebalance\_move函数
 > |ITEM_CHUNK | #define ITEM_CHUNK 64 | 用于表示item本身是否为chunk |
 > |ITEM_HDR | #define ITEM_HDR 128 | 暂时不知道 |
 
+整个`slab_rebalance_move`函数的流程图形如下：
+
+![slab_rebalance_move流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_rebalance/slab_rebalance_move.png)
