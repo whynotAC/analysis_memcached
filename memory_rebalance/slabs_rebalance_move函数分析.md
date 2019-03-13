@@ -296,3 +296,21 @@ slab\_rebalance\_move函数
 整个`slab_rebalance_move`函数的流程图形如下：
 
 ![slab_rebalance_move流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_rebalance/slab_rebalance_move.png)
+
+> PS: 上图解释
+> 
+> * 上图中红色部分为可以转移的状态。
+> * 上图中橙色部分为不可以转移的状态。
+> * 可以转移的`item`只能是在`slab`空闲队列中或者`refcount=2`时的`lru`队列中。
+> * 其他状态都是不可转移状态。
+> * 当转移完成时，将`item`的`it_flags`置为`ITEM_SLABBED|ITEM_FETCHED`。 
+
+5 补充内容
+---------------------------------
+`slab`中保存的内容有两种:
+
+* `item`，可以独自成双向链。
+* `item_chunk`，必须有一个`item`的头。
+
+![slab_rebalance_move流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_rebalance/item_and_item_chunk.png)
+ 
