@@ -125,6 +125,7 @@ slab\_rebalance\_move函数
 >			size_t ntotal = 0;
 >			switch (status) {
 >				case MOVE_FROM_LRU:
+>					// 从LRU链中去除item时，需要判断是否需要申请新空间来存放原有内容
 >					/* Lock order is LRU locks -> slabs_lock. unlink uses LRU lock.
 >					 * We only need to hold the slabs_lock while initially looking
 >					 * at an item, and at this point we have an exclusive refcount
@@ -304,6 +305,7 @@ slab\_rebalance\_move函数
 > * 可以转移的`item`只能是在`slab`空闲队列中或者`refcount=2`时的`lru`队列中。
 > * 其他状态都是不可转移状态。
 > * 当转移完成时，将`item`的`it_flags`置为`ITEM_SLABBED|ITEM_FETCHED`。 
+> * 获取锁的顺序为`item_lock`->`lru_lock`->`slabs_lock`。
 
 5 补充内容
 ---------------------------------
