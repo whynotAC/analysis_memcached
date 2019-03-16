@@ -1,5 +1,59 @@
 #pragma once
 
+/* initial power multiplier for the hash table */
+#define HASHPOWER_DEFAULT 16
+#define HASHPOWER_MAX 32
+
+/* Slab sizing definitions. */
+#define POWER_SMALLEST  1
+#define POWER_LARGEST   256 /* actual cap is 255*/
+#define SLAB_GLOBAL_PAGE_POOL 0 /* magic slab class for storing pages for reassignment */
+#define CHUNK_ALIGN_BYTES 8
+/* slab class max is a 6-bit number, -1. */
+#define MAX_NUMBER_OF_SLAB_CLASSES (63+1)
+
+/**
+ * How long an object can reasonably be assumed to be locked before
+ * harvesting it on a low memory conditio. Default: disabled
+ */
+#define TAIL_REPAIR_TIME_DEFAULT 0
+
+/**
+ * waring: don't use these macros with a function, as it evals its arg twice
+ */
+#define ITEM_get_cas(i) (((i)->it_flags & ITEM_CAS) ? \
+        (i)->data->cas : (uint64_t)0)
+
+#define ITEM_set_cas(i, v) { \
+    if ((i)->it_flags & ITEM_CAS) { \
+        (i)->data->cas = v; \
+    } \
+}
+
+#define ITEM_key(item) (((char*)&((item)->data)) \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_suffix(item) ((char*) &((item)->data) + (item)->nkey + 1 \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_data(item) ((char*) &((item)->data) + (item)->nkey + 1 \
+         + (item)->nsuffix \
+         + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
+         + (item)->nsuffix + (item)->nbytes \
+         +(((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
+#define ITEM_lruid(item) ((item)->slabs_clsid & (3<<6))
+
+enum pause_thread_types {
+    PAUSE_WORKER_THREADS = 0,
+    PAUSE_ALL_THREADS,
+    RESUME_ALL_THREADS,
+    RESUME_WORKER_THREADS
+};
+
 /**
  * When adding a setting, be sure to update process_stat_settings
  * Globally accessible settings as derived from commandline. 
@@ -11,6 +65,7 @@ struct settings {
     uint64_t oldest_cas; // ignore existing items with CAS values lower than this
     double factor; // chunk size growth factor
     int chunk_size;
+    int num_threads;
     bool use_cas;
 
     int item_size_max; // Maximum item size
@@ -119,6 +174,9 @@ struct slab_rebalance {
 
 extern struct slab_rebalance slab_rebal;
 
+#define mutex_lock(x) pthread_mutex_lock(x)
+#define mutex_unlock(x) pthread_mutex_unlock(x)
+
 #include "slabs.h"
 #include "assoc.h"
 #include "items.h"
@@ -143,4 +201,9 @@ int item_replace(item *it, item *new_it, const uint32_t hv);
 void item_unlink(item *it);
 
 void item_lock(uint32_t hv);
-
+void *item_trylock(uint32_t hv);
+void item_trylock_unlock(void *arg);
+void item_unlock(uint32_t hv);
+void pause_thread(enum pause_thread_types type);
+#define refcount_incr(it) ++(it->refcount)
+#define refcount_decr(it) --(it->refcount)
