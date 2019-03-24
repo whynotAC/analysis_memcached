@@ -1,5 +1,10 @@
 #pragma once
 
+#include <cstdint>
+#include <cstring>
+
+#include "memcached.h"
+
 /**
  * Init the subsystem. 1st argument is the limit on no, of bytes to allocate,
  * 0 if no limit. 2nd argument is the growth factor; each slab will use a chunk
@@ -39,7 +44,7 @@ typedef struct {
     unsigned int chunk_size;
     long int free_chunks;
     long int total_pages;
-} slab_stats_autoremove;
+} slab_stats_automove;
 void fill_slab_stats_automove(slab_stats_automove *am);
 unsigned int global_page_pool_size(bool *mem_flag);
 

@@ -1,5 +1,38 @@
 #include "memcached.h"
 
+#define LARGEST_ID POWER_LARGEST
+typedef struct {
+    uint64_t evicted;
+    uint64_t evicted_nonzero;
+    uint64_t reclaimed;
+    uint64_t outofmemory;
+    uint64_t tailrepairs;
+    uint64_t expired_unfetched; /* items reclaimed but nerver touched */
+    uint64_t evicted_unfetched; /* items evicted but never touched */
+    uint64_t evicted_active; /* items evicted that should have been shuffled */
+    uint64_t crawler_reclaimed;
+    uint64_t crawler_items_checked;
+    uint64_t lrutail_reflocked;
+    uint64_t moves_to_cold;
+    uint64_t moves_to_warm;
+    uint64_t moves_within_lru;
+    uint64_t direct_reclaims;
+    uint64_t hits_to_hot;
+    uint64_t hits_to_warm;
+    uint64_t hits_to_cold;
+    uint64_t hits_to_temp;
+    rel_time_t evicted_time;
+} itemstats_t;
+
+static item *heads[LARGEST_ID];
+static item *tails[LARGEST_ID];
+static itemstats_t itemstats[LARGEST_ID];
+static unsigned int sizes[LARGEST_ID];
+static uint64_t sizes_bytes[LARGEST_ID];
+static unsigned int *stats_sizes_hist = NULL;
+static uint64_t stats_sizes_cas_min = 0;
+static int stats_sizes_buckets = 0;
+
 static int lru_maintainer_initialized = 0;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -9,7 +42,7 @@ uint64_t get_cas_id(void) {
     static uint64_t cas_id = 0;
     pthread_mutex_lock(&cas_id_lock);
     uint64_t next_id = ++cas_id;
-    pthread_mutesx_unlock(&cas_id_lock);
+    pthread_mutex_unlock(&cas_id_lock);
     return next_id;
 }
 
@@ -376,6 +409,132 @@ int do_item_replace(item *it, item *new_it, const uint32_t hv) {
 
     do_item_unlink(it, hv);
     return do_item_link(new_it, hv);
+}
+
+/**
+ * wrapper around assoc_find which does the lazy expiration logic 
+ */
+item *do_item_get(const char *key, const size_t nkey, const uint32_t hv,
+                    conn *c, const bool do_update) {
+    item *it = assoc_find(key, nkey, hv);
+    if (it != NULL) {
+        refcount_incr(it);
+        /* Optimization for slab reassignment. prevents popular items from
+         * jamming in busy wait. Can only do this here to satisfy lock 
+         * order of item_lock, slabs_lock.
+         * This was made unsafe by removal of the cache_lock:
+         * slab_rebalance_signal and slab_rebal.* are modified in a
+         * separate thread under slabs_lock. If slab_rebalance_signal = 1,
+         * slab_start = NULL(0), but slab_end is still equal to some value
+         * this would end up unlinking every item fetched.
+         * This is either an acceptable loss, or if slab_rebalance_signal
+         * is true, slab_start/slab_end should be put behind the slabs_lock
+         * Which would cause a huge potential slowdown
+         * Could also use a specific lock for slab_rebal.* and
+         * slab_rebalance_signal (shorter lock?)
+         */
+        /* if (slab_rebalance_signal &&
+         *      ((void *)it >= slab_rebal.slab_start && 
+         *       (void *)it < slab_rebal.slab_end)) {
+         *    do_item_unlink(it, hv);
+         *    do_item_remove(it);
+         *    it = NULL;
+         * }
+         */
+    }
+    int was_found = 0;
+
+    if (settings.verbose > 2) {
+        int ii;
+        if (it == NULL) {
+            fprintf(stderr, "> NOT FOUND ");
+        } else {
+            fprintf(stderr, "> FOUND KEY ");
+        }
+        for (ii = 0; ii < nkey; ++ii) {
+            fprintf(stderr, "%c", key[ii]);
+        }
+    }
+
+    if (it != NULL) {
+         was_found = 1;
+         if (item_is_flushed(it)) {
+            do_item_unlink(it, hv);
+            do_item_remove(it);
+            it = NULL;
+            was_found = 2;
+         } else if (it->exptime != 0 && it->exptime <= current_time) {
+            do_item_unlink(it, hv);
+            do_item_remove(it);
+            it = NULL;
+            was_found = 3;
+         } else {
+            if (do_update) {
+                /* We update the hit markers only during fetches.
+                 * An item needs tb be hit twice overall to be considered
+                 * ACTIVE, but only needs a single hit to maintain 
+                 * activity afterward.
+                 * FETCHED tells if an item has ever been active.
+                 */
+                if (settings.lru_segmented) {
+                    if ((it->it_flags & ITEM_ACTIVE) == 0) {
+                        if ((it->it_flags & ITEM_FETCHED) == 0) {
+                            it->it_flags |= ITEM_FETCHED;
+                        } else {
+                            it->it_flags |= ITEM_ACTIVE;
+                            if (ITEM_lruid(it) != COLD_LRU) {
+                                do_item_update(it); // bump LA time
+                            } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                                // and flag before async bump to avoid race
+                                it->it_flags &= ~ITEM_ACTIVE;
+                            }
+                        }
+                    }
+                } else {
+                    it->it_flags |= ITEM_FETCHED;
+                    do_item_update(it);
+                }
+            }
+         }
+    }
+
+    return it;
+}
+
+item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
+                        const uint32_t hv, conn *c) {
+    item *it = do_item_get(key, nkey, hv, c, DO_UPDATE);
+    if (it != NULL) {
+        it->exptime = exptime;
+    }
+    return it;
+}
+
+/**
+ * With refactoring of the various stats code the automover won't need a 
+ * custom function here.
+ */
+void fill_item_stats_automove(item_stats_automove *am) {
+    int n;
+    for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+        item_stats_automove *cur = &am[n];
+
+        int i = n | HOT_LRU;
+        pthread_mutex_lock(&lru_locks[i]);
+        cur->autofmemory = itemstats[i].outofmemory;
+        pthread_mutex_unlock(&lru_locks[i]);
+
+        // evictions and tail age are from COLD
+        i = n | COLD_LRU;
+        pthread_mutex_lock(&lru_locks[i]);
+        cur->evicted = itemstats[i].evicted;
+        if (tails[i]) {
+            cur->age = current_time - tails[i]->time;
+        } else {
+            cur->age = 0;
+        }
+        pthread_mutex_unlock(&lru_locks[i]);
+    }
 }
 
 int init_lru_maintainer(void) {

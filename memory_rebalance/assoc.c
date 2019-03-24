@@ -21,7 +21,7 @@ typedef unsigned      char  ub1;
 unsigned int hashpower = HASHPOWER_DEFAULT;
 
 #define hashsize(n) ((ub4)1<<(n))
-#define hashmaks(n) (hashsize(n)-1)
+#define hashmask(n) (hashsize(n)-1)
 
 /* Main hash table. This is where we lock except during expansion. */
 static item** primary_hashtable = 0;
@@ -46,7 +46,7 @@ void assoc_init(const int hashtable_init) {
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
-    primary_hashtable = calloc(hashsize(hahspower), sizeof(void *));
+    primary_hashtable = (item **)calloc(hashsize(hashpower), sizeof(void *));
     if (! primary_hashtable) {
         fprintf(stderr, "Failed to init hashtable.\n");
         exit(EXIT_FAILURE);
@@ -102,7 +102,7 @@ static item** _hashitem_before(const char *key, const size_t nkey, const uint32_
 static void assoc_expand(void) {
     old_hashtable = primary_hashtable;
 
-    primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));
+    primary_hashtable = (item **)calloc(hashsize(hashpower + 1), sizeof(void *));
     if (primary_hashtable) {
         if (settings.verbose > 2) {
             fprintf(stderr, "Hash table expansion starting\n");
@@ -223,9 +223,9 @@ static void *assoc_maintenance_thread(void *arg) {
              * to allow dynamic hash table expansion without causing 
              * significant wait times.
              */
-            pasue_threads(PAUSE_ALL_THREADS);
+            pause_thread(PAUSE_ALL_THREADS);
             assoc_expand();
-            pause_threads(RESUME_ALL_THREADS);
+            pause_thread(RESUME_ALL_THREADS);
         }
     }
     return NULL;

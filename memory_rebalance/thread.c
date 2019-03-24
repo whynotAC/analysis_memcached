@@ -9,6 +9,23 @@
 #include <string.h>
 #include <pthread.h>
 
+extern item *do_item_get(const char *key, const size_t nkey, 
+    const uint32_t hv, conn *c, const bool do_update);
+extern item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
+    const uint32_t hv, conn *c);
+extern delta_result_type do_add_delta(conn *c, const char *key,
+    const size_t nkey, const bool incr, const int64_t delta, char *buf,
+    uint64_t *cas, const uint32_t hv);
+extern store_item_type do_store_item(item *item, int comm, conn *c,
+    const uint32_t hv);
+
+/* Locks for cache LRU operations. */
+pthread_mutex_t lru_locks[POWER_LARGEST];
+
+/* Lock for global stats */
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
 static pthread_mutex_t *item_locks;
 /* size of the item lock hash table */
 static uint32_t item_lock_count;
@@ -56,7 +73,7 @@ void pause_threads(enum pause_thread_types type) {
     switch (type) {
         case PAUSE_ALL_THREADS:
             // lru_maintainer_pause();
-            slabs_rebalance_pause();
+            slabs_rebalancer_pause();
             // lru_crawler_pause();
         case PAUSE_WORKER_THREADS:
             buf[0] = 'p';
@@ -64,7 +81,7 @@ void pause_threads(enum pause_thread_types type) {
             break;
         case RESUME_ALL_THREADS:
             // lru_maintainer_resume();
-            slabs_rebalance_resume();
+            slabs_rebalancer_resume();
             // lru_crawler_resume();
         case RESUME_WORKER_THREADS:
             //pthread_mutex_unlock(&worker_hang_lock);
@@ -91,13 +108,14 @@ void pause_threads(enum pause_thread_types type) {
     wait_for_thread_registration(settings.num_threads);
     pthread_mutex_unlock(&init_lock);
     */
-`}
+}
 
 /*********************** ITEM ACCESS ************************/
 /*
  * Allocates a new item.
  */
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes) {
+    item *it;
     /* do_item_alloc handles its own locks */
     it = do_item_alloc(key, nkey, flags, exptime, nbytes);
     return it;
@@ -112,7 +130,7 @@ item *item_get(const char *key, const size_t nkey, conn *c, const bool do_update
     uint32_t hv;
     hv = hash(key, nkey);
     item_lock(hv);
-    it = do_item_get(key, nky, hv, c, do_update);
+    it = do_item_get(key, nkey, hv, c, do_update);
     item_unlock(hv);
     return it;
 }
@@ -205,6 +223,16 @@ enum store_item_type store_item(item *item, int comm, conn *c) {
     return ret;
 }
 
+/**************************************** GLOBAL STATS ********************/
+
+void STATS_LOCK() {
+    pthread_mutex_lock(&stats_lock);
+}
+
+void STATS_UNLOCK() {
+    pthread_mutex_unlock(&stats_lock);
+}
+
 /*
  * Initializes the thread subsystem, creating various worker threads.
  *
@@ -239,7 +267,7 @@ void memcached_thread_init(int nthreads, void *arg) {
     item_lock_count = hashsize(power);
     item_lock_hashpower = power;
 
-    item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
+    item_locks = (pthread_mutex_t *)calloc(item_lock_count, sizeof(pthread_mutex_t));
     if (! item_locks) {
         perror("Can't allocate item locks");
         exit(1);

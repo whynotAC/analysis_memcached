@@ -1,7 +1,7 @@
 #include "memcached.h"
 #include "slab_automove_extstore.h"
-#include <stdblib.h>
-#include <string.h>
+#include <cstdlib>
+#include <cstring>
 
 #define MIN_PAGES_FOR_SOURCE 2
 #define MIN_PAGES_FOR_RECLAIM 2.5
