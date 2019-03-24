@@ -19,6 +19,15 @@ int do_item_replace(item *it, item *new_it, const uint32_t hv);
 
 int item_is_flushed(item *it);
 
+/**
+ * stats getter for slab automover
+ */
+typedef struct {
+    int64_t evicted;
+    int64_t autofmemory;
+    uint32_t age;
+} item_stats_automove;
+void fill_item_stats_automove(item_stats_automove *am);
 
 int init_lru_maintainer(void);
 

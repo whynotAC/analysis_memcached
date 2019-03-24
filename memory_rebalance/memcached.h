@@ -1,8 +1,28 @@
 #pragma once
 
+#include <cstdint>
+#include <cstring>
+#include <pthread.h>
+#include <unistd.h>
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+
+#include "logger.h"
+
+/* Maximum length of a key. */
+#define KEY_MAX_LENGTH 250
+
 /* initial power multiplier for the hash table */
 #define HASHPOWER_DEFAULT 16
 #define HASHPOWER_MAX 32
+
+/*
+ * We only reposition items in the LRU queue if they haven't been repositioned
+ * in this many seconds. That saves use from churning on frequently-accessed
+ * items.
+ */
+#define ITEM_UPDATE_INTERVAL 60
 
 /* Slab sizing definitions. */
 #define POWER_SMALLEST  1
@@ -47,12 +67,107 @@
 #define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
 #define ITEM_lruid(item) ((item)->slabs_clsid & (3<<6))
 
+#define STAT_KEY_LEN 128
+#define STAT_VAL_LEN 128
+
+/** Append a simple stat with a stat name, value format and value */
+#define APPEND_STAT(name, fmt, val) \
+            append_stat(name, add_stats, c, fmt, val);
+
+/* Append an indexed stat with a stat name(with format), value format and value.
+ */
+#define APP_NUM_FMT_STAT(name_fmt, num, name, fmt, val)     \
+  klen = snprintf(key_str, STAT_KEY_LEN, name_fmt, num, name);  \
+  vlen = snprintf(val_str, STAT_VAL_LEN, fmt, val);             \
+  add_stats(key_str, klen, val_str, vlen, c);
+
+/** Common APPEND_NUM_FMT_STAT format.  */
+#define APPEND_NUM_STAT(num, name, fmt, val)    \
+    APPEND_NUM_FMT_STAT("%d:%s", num, name, fmt, val)
+
+/**
+ * Callback for any function producing stats.
+ *
+ * @param key the stat's key
+ * @param klen length of the key
+ * @param val the stat's value in an ascii form 
+ * @param vlen length of the value
+ * @param cookie magic callback cookie
+ */
+typedef void (*ADD_STAT)(const char *key, const uint16_t klen,
+                         const char *val, const uint32_t vlen,
+                         const void *cookie);
+
 enum pause_thread_types {
     PAUSE_WORKER_THREADS = 0,
     PAUSE_ALL_THREADS,
     RESUME_ALL_THREADS,
     RESUME_WORKER_THREADS
 };
+
+enum store_item_type {
+    NOT_STORED=0, STORED, EXISTS, NOT_FOUND, TOO_LARGE, NO_MEMORY
+};
+
+enum delta_result_type {
+    OK, NON_NUMERIC, EOM, DELTA_ITEM_NOT_FOUND, DELTA_ITEM_CAS_MISMATCH
+};
+
+/* 
+ * Globals stats. Only resettable stats should go into this structure.
+ */
+struct stats {
+    uint64_t    total_items;
+    uint64_t    total_conns;
+    uint64_t    rejected_conns;
+    uint64_t    malloc_fails;
+    uint64_t    listen_disabled_num;
+    uint64_t    slabs_move;     // times slabs were moved around
+    uint64_t    slab_reassign_rescues; // items rescued during slab move
+    uint64_t    slab_reassign_evictions_nomem; // valid items lost during slab
+                                                // move
+    uint64_t    slab_reassign_inline_reclaim;   // valid items lost during slab
+                                                // move
+    uint64_t    slab_reassign_chunk_rescues;    // chunked-item chunks recovered
+    uint64_t    slab_reassign_busy_items;       // valid temporarily unmovable
+    uint64_t    slab_reassign_busy_deletes;     // refcounted items killed
+    uint64_t    lru_crawler_starts; // Number of item crawlers kicked off
+    uint64_t    lru_maintainer_juggles; // number of LRU bg pokes
+    uint64_t    time_in_listen_disabled_us; // elapsed time in microseconds 
+                                            // while server unable to process
+                                            // new connections
+    uint64_t    log_worker_dropped;     // logs dropped by worker threads
+    uint64_t    log_worder_written;     // logs written by worker threads
+    uint64_t    log_watcher_skipped;    // logs watchers missed
+    uint64_t    log_watcher_sent;       // logs sent to watcher buffers
+#ifdef EXTSTORE
+    uint64_t    extstore_compact_lost;  // items lost because they were locked
+    uint64_t    extstore_compact_rescues; // items re-written during compaction
+    uint64_t    extstore_compact_skipped; // unhit times skipped during 
+                                            // compaction
+#endif
+    struct  timeval maxconns_entered;   // last time maxonns entered
+};
+
+/**
+ * GLobal "state" stats. Reflects state that shouldn't be wiped ever.
+ * Ordered for some cache line locality for commonly updated counters.
+ */
+struct stats_state {
+    uint64_t        curr_items;
+    uint64_t        curr_bytes;
+    uint64_t        curr_conns;
+    uint64_t        hash_bytes;     // size used for hash tables
+    unsigned int    conn_structs;
+    unsigned int    reserved_fds;
+    unsigned int    hash_power_level; // Better hope it's not over 9000
+    bool            hash_is_expanding; // If the hash table is being expanded
+    bool            accepting_conns;    // whether we are currently accepting
+    bool            slab_reassign_running; // slab reassign in progress
+    bool            lru_crawler_running;    // crawl in progress
+};
+
+#define MAX_VERBOSITY_LEVEL 2
 
 /**
  * When adding a setting, be sure to update process_stat_settings
@@ -80,7 +195,7 @@ struct settings {
     int tail_repair_time;
     bool flush_enabled;
     char *hash_algorithm;
-}
+};
 
 extern struct settings settings;
 
@@ -150,6 +265,13 @@ typedef struct _strchunk {
     char data[];
 } item_chunk;
 
+typedef struct conn conn;
+/**
+ * The structure representing a connection into memecached.
+ */
+struct conn {
+};
+
 /* current time of day (updated periodically)*/
 extern volatile rel_time_t current_time;
 
@@ -207,3 +329,9 @@ void item_unlock(uint32_t hv);
 void pause_thread(enum pause_thread_types type);
 #define refcount_incr(it) ++(it->refcount)
 #define refcount_decr(it) --(it->refcount)
+void STATS_LOCK(void);
+void STATS_UNLOCK(void);
+
+/* Stat processing functions */
+void append_stat(const char *name, ADD_STAT add_stats, conn *c,
+    const char *fmt, ...);

@@ -20,6 +20,8 @@
 #include <assert.h>
 #include <pthread.h>
 
+extern stats_state stats_state;
+
 //#define DEBUG_SLAB_MOVER
 //powers-of-N allocation structures
 typedef struct {
@@ -169,7 +171,7 @@ void slabs_prefill_global(void) {
     slabclass_t *p = &slabclass[0];
     int len = settings.slab_page_size;
 
-    while (mem_mallocaed < mem_limit
+    while (mem_malloced < mem_limit
             && (ptr = memory_allocate(len)) != NULL) {
         grow_slab_list(0);
         p->slab_list[p->slabs++] = ptr;
@@ -207,7 +209,7 @@ static int grow_slab_list(const unsigned int id) {
         void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
         if (new_list == 0) return 0;
         p->list_size = new_size;
-        p->slab_list = new_list;
+        p->slab_list = (void **)new_list;
     }
     return 1;
 }
@@ -227,7 +229,7 @@ static void *get_page_from_global_pool(void) {
     if (p->slabs < 1) {
         return NULL;
     }
-    char *ret = p->slab_list[p->slabs - 1];
+    char *ret = (char*)(p->slab_list[p->slabs - 1]);
     p->slabs--;
     return ret;
 }
@@ -239,18 +241,16 @@ static int do_slabs_newslab(const unsigned int id) {
                 ? settings.slab_page_size : p->size * p->perslab;
     char *ptr;
 
-    if ((mem_limit && mem_alloced + len > mem_limit && p->slabs > 0 
+    if ((mem_limit && mem_malloced + len > mem_limit && p->slabs > 0 
           && p->slabs == 0)) {
         mem_limit_reached = true;
-        MEMCACHED_SLABS_SLABCLASS_ALLOCATE_FAILED(id);
         return 0;
     }
 
     if ((grow_slab_list(id) == 0) ||
-        (((ptr = get_page_from_global_pool()) == NULL) &&
-        ((ptr = memory_allocate((size_t)len)) == 0))) {
+        (((ptr = (char *)get_page_from_global_pool()) == NULL) &&
+        ((ptr = (char *)memory_allocate((size_t)len)) == 0))) {
 
-        MEMCACHED_SLABS_SLABCLASS_ALLOCATE_FAILED(id);
         return 0;
     }
 
@@ -258,7 +258,6 @@ static int do_slabs_newslab(const unsigned int id) {
     split_slab_page_into_freelist(ptr, id);
 
     p->slab_list[p->slabs++] = ptr;
-    MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
 
     return 1;
 }
@@ -271,7 +270,6 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
     item *it = NULL;
 
     if (id < POWER_SMALLEST || id > power_largest) {
-        MEMCACHED_SLABS_ALLOCATE_FAILED(size, 0);
         return NULL;
     }
     p = &slabclass[id];
@@ -285,7 +283,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
      * fail unless we have space at the end of a recently allocated page,
      * we have something on our freelist, or we could allocate a new page.
      */
-    if (p->sl_curr == 0 && flag != SLABS_ALLOC_NO_NEWPAGE) {
+    if (p->sl_curr == 0 && flags != SLABS_ALLOC_NO_NEWPAGE) {
         do_slabs_newslab(id);
     }
 
@@ -306,9 +304,7 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_
 
     if (ret) {
         p->requested += size;
-        MEMCACHED_SLABS_ALLOCATE(size, id, p->size, ret);
     } else {
-        MEMCACHED_SLABS_ALLOCATE_FAILED(size, id);
     }
 
     return ret;
@@ -334,7 +330,7 @@ static void do_slabs_free_chunked(item *it, const size_t size) {
     // return the header object
     // TODO: This is in three places, here and in do_slabs_free()
     it->prev = 0;
-    it->next = p->slots;
+    it->next = (item *)p->slots;
     if (it->next) it->next->prev = it;
     p->slots = it;
     p->sl_curr++;
@@ -353,7 +349,7 @@ static void do_slabs_free_chunked(item *it, const size_t size) {
         next_chunk = chunk->next;
 
         chunk->prev = 0;
-        chunk->next = p->slots;
+        chunk->next = (item_chunk *)p->slots;
         if (chunk->next) chunk->next->prev = chunk;
         p->slots = chunk;
         p->sl_curr++;
@@ -373,7 +369,6 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
     if (id < POWER_SMALLEST || id > power_largest)
         return;
 
-    MEMCACHED_SLABS_FREE(size, id, ptr);
     p = &slabclass[id];
 
     it = (item *)ptr;
@@ -384,7 +379,7 @@ static void do_slabs_free(void *ptr, const size_t size, unsigned int id) {
         it->it_flags = ITEM_SLABBED;
         it->slabs_clsid = 0;
         it->prev = 0;
-        it->next = p->slots;
+        it->next = (item *)p->slots;
         if (it->next) it->next->prev = it;
         p->slots = it;
 
@@ -429,7 +424,7 @@ unsigned int global_page_pool_size(bool *mem_flag) {
     unsigned int ret = 0;
     pthread_mutex_lock(&slabs_lock);
     if (mem_flag != NULL)
-        *mem_flag = mem_mallocaed >= mem_limit ? true : false;
+        *mem_flag = mem_malloced >= mem_limit ? true : false;
     ret = slabclass[SLAB_GLOBAL_PAGE_POOL].slabs;
     pthread_mutex_unlock(&slabs_lock);
     return ret;

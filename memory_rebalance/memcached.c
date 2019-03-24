@@ -44,6 +44,33 @@ static void settings_init(void) {
  */
 volatile rel_time_t current_time;
 
+void append_stat(const char *name, ADD_STAT add_stats, conn *c,
+                    const char *fmt, ...) {
+}
+
+/*
+ * Stores an item in the cache according to the semantics of one of the set
+ * commands. In threaded mode, this is protected by the cache lock.
+ */
+enum store_item_type do_store_item(item *it, int comm, conn *c,
+    const uint32_t hv) {
+}
+
+/**
+ * adds a delta value to a numeric item.
+ *
+ * c        connection requesting the operation
+ * it       item to adjust
+ * incr     true to increment value, false to decrement
+ * delta    amount to adjust value by
+ * buf      buffer for reponse string
+ *
+ * returns a response string to send back to the client.
+ */
+enum delta_result_type do_add_delta(conn *c, const char *key, 
+    const size_t nkey, const bool incr, const int64_t delta,
+    char *buf, uint64_t *cas, const uint32_t hv) {
+}
 
 int main (int argc, char **argv) {
     
@@ -64,17 +91,17 @@ int main (int argc, char **argv) {
 
     if (hash_init(hash_type) != 0) {
         fprintf(stderr, "Failed to initialize hash_algorithm!\n");
-        exit(EX_USAGE);
+        exit(EXIT_FAILURE);
     }
 
     assoc_init(settings.hashpower_init);
     slabs_init(settings.maxbytes, settings.factor, preallocate,
-                use_slabs_sizes ? slab_sizes : NULL);
+                use_slab_sizes ? slab_sizes : NULL);
 
 #ifdef EXTSTORE
     memcached_thread_init(settings.num_threads, storage);
 #else
-    memcacehd_thread_init(settings.num_threads, NULL);
+    memcached_thread_init(settings.num_threads, NULL);
 #endif
 
     if (start_assoc_maint && start_assoc_maintenance_thread() == -1) {
@@ -85,7 +112,7 @@ int main (int argc, char **argv) {
             start_slab_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
     }
-
+    
     stop_assoc_maintenance_thread();
     
     return retval;
