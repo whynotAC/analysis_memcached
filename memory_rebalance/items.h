@@ -19,6 +19,17 @@ int do_item_replace(item *it, item *new_it, const uint32_t hv);
 
 int item_is_flushed(item *it);
 
+void item_stats(ADD_STAT add_stats, void *c);
+void item_stats_totals(ADD_STAT add_stats, void *c);
+
+void item_stats_sizes(ADD_STAT add_stats, void *c);
+void item_stats_sizes_init(void);
+void item_stats_sizes_enable(ADD_STAT add_stats, void *c);
+void item_stats_sizes_disable(ADD_STAT add_stats, void *c);
+void item_stats_sizes_add(item *it);
+void item_stats_sizes_remove(item *it);
+void item_stats_sizes_status(void);
+
 /**
  * stats getter for slab automover
  */
