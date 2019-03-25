@@ -72,7 +72,7 @@
 
 /** Append a simple stat with a stat name, value format and value */
 #define APPEND_STAT(name, fmt, val) \
-            append_stat(name, add_stats, c, fmt, val);
+            append_stat(name, add_stats, (conn *)c, fmt, val);
 
 /* Append an indexed stat with a stat name(with format), value format and value.
  */

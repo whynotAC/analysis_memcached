@@ -1,6 +1,10 @@
 #include "memcached.h"
 
+
 #define LARGEST_ID POWER_LARGEST
+
+extern pthread_mutex_t lru_locks[POWER_LARGEST];
+
 typedef struct {
     uint64_t evicted;
     uint64_t evicted_nonzero;
@@ -409,6 +413,33 @@ int do_item_replace(item *it, item *new_it, const uint32_t hv) {
 
     do_item_unlink(it, hv);
     return do_item_link(new_it, hv);
+}
+
+void item_stats_totals(ADD_STAT add_stats, void *c) {
+    itemstats_t totals;
+    memset(&totals, 0, sizeof(itemstats_t));
+    int n;
+    for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+        int x;
+        int i;
+        for (x = 0; x < 4; x++) {
+            i = n | lru_type_map[x];
+            pthread_mutex_lock(&lru_locks[i]);
+            totals.expired_unfetched += itemstats[i].expired_unfetched;
+            totals.evicted_unfetched += itemstats[i].evicted_unfetched;
+            totals.evicted_active += itemstats[i].evicted_active;
+            totals.evicted += itemstats[i].evicted;
+            totals.reclaimed += itemstats[i].reclaimed;
+            totals.crawler_reclaimed += itemstats[i].crawler_reclaimed;
+            totals.crawler_items_checked += itemstats[i].crawler_items_checked;
+            totals.lrutail_reflocked += itemstats[i].lrutail_reflocked;
+            totals.moves_to_cold += itemstats[i].moves_to_cold;
+            totals.moves_to_warm += itemstats[i].moves_to_warm;
+            totals.moves_within_lru += itemstats[i].moves_within_lru;
+            totals.direct_reclaims += itemstats[i].direct_reclaims;
+            pthread_mutex_unlock(&lru_locks[i]);
+        }
+    }
 }
 
 /**
