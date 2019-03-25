@@ -21,6 +21,7 @@
 #include <pthread.h>
 
 extern stats_state stats_state;
+extern stats stats;
 
 //#define DEBUG_SLAB_MOVER
 //powers-of-N allocation structures
@@ -444,7 +445,7 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
             STATS_LOCK();
             APPEND_STAT("bytes", "%llu", (unsigned long long)stats_state.curr_bytes);
             APPEND_STAT("curr_items", "%llu", (unsigned long long)stats_state.curr_items);
-            APPEND_STAT("total_items", "%llu", (unsigned long long)stats_state.total_items);
+            APPEND_STAT("total_items", "%llu", (unsigned long long)stats.total_items);
             STATS_UNLOCK();
             pthread_mutex_lock(&slabs_lock);
             APPEND_STAT("slab_global_page_pool", "%u", slabclass[SLAB_GLOBAL_PAGE_POOL].slabs);
@@ -456,7 +457,7 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
             slabs_stats(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "sizes") == 0) {
             item_stats_sizes(add_stats, c);
-        } else if (nz_strcmp(neky, stat_type, "sizes_enable") == 0) {
+        } else if (nz_strcmp(nkey, stat_type, "sizes_enable") == 0) {
             item_stats_sizes_enable(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "sizes_disable") == 0) {
             item_stats_sizes_disable(add_stats, c);

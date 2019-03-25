@@ -41,6 +41,10 @@ static int lru_maintainer_initialized = 0;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static uint64_t lru_total_bumps_dropped(void) {
+    return 0;
+}
+
 /* Get the next CAS id for a new item. */
 uint64_t get_cas_id(void) {
     static uint64_t cas_id = 0;
@@ -415,6 +419,8 @@ int do_item_replace(item *it, item *new_it, const uint32_t hv) {
     return do_item_link(new_it, hv);
 }
 
+
+
 void item_stats_totals(ADD_STAT add_stats, void *c) {
     itemstats_t totals;
     memset(&totals, 0, sizeof(itemstats_t));
@@ -440,6 +446,66 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
             pthread_mutex_unlock(&lru_locks[i]);
         }
     }
+    APPEND_STAT("expired_unfetched", "%llu", 
+            (unsigned long long)totals.expired_unfetched);
+    APPEND_STAT("evicted_unfetched", "%llu",
+            (unsigned long long)totals.evicted_unfetched);
+    if (settings.lru_maintainer_thread) {
+        APPEND_STAT("evicted_active", "%llu",
+            (unsigned long long)totals.evicted_active);
+    }
+    APPEND_STAT("evictions", "%llu",
+            (unsigned long long)totals.evicted);
+    APPEND_STAT("reclaimed", "%llu",
+            (unsigned long long)totals.reclaimed);
+    APPEND_STAT("crawler_reclaimed", "%llu",
+            (unsigned long long)totals.crawler_reclaimed);
+    APPEND_STAT("crawler_items_checked", "%llu",
+            (unsigned long long)totals.crawler_items_checked);
+    APPEND_STAT("lrutail_reflocked", "%llu",
+            (unsigned long long)totals.lrutail_reflocked);
+    if (settings.lru_maintainer_thread) {
+        APPEND_STAT("moves_to_cold", "%llu",
+            (unsigned long long)totals.moves_to_cold);
+        APPEND_STAT("moves_to_warm", "%llu",
+            (unsigned long long)totals.moves_to_warm);
+        APPEND_STAT("moves_within_lru", "%llu",
+            (unsigned long long)totals.moves_within_lru);
+        APPEND_STAT("direct_reclaims", "%llu",
+            (unsigned long long)totals.direct_reclaims);
+        APPEND_STAT("lru_bumps_dropped", "%llu",
+            (unsigned long long)lru_total_bumps_dropped());
+    }
+}
+
+void item_stats(ADD_STAT add_stats, void *c) {
+}
+
+bool item_stats_sizes_status(void) {
+}
+
+void item_stats_sizes_init(void) {
+}
+
+void item_stats_sizes_enable(ADD_STAT add_stats, void *c) {
+}
+
+void item_stats_sizes_diable(ADD_STAT add_stats, void *c) {
+}
+
+void item_stats_sizes_add(item *it) {
+}
+
+void item_stats_sizes_remove(item *it) {
+}
+
+/**
+ * dumps out a list of objects of each size, with granularity of 32 bytes
+ * Locks are correct based on a technicality. Holds LRU lock while doing the
+ * work, so items can't go invalid, and it's only looking at header sizes
+ * which don't change.
+ */
+void item_stats_sizes(ADD_STAT add_stats, void *c) {
 }
 
 /**
