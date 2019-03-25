@@ -444,7 +444,7 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
             STATS_LOCK();
             APPEND_STAT("bytes", "%llu", (unsigned long long)stats_state.curr_bytes);
             APPEND_STAT("curr_items", "%llu", (unsigned long long)stats_state.curr_items);
-            APPEND_STAT("total_items", "%llu", (unsigned long long)stat.total_items);
+            APPEND_STAT("total_items", "%llu", (unsigned long long)stats_state.total_items);
             STATS_UNLOCK();
             pthread_mutex_lock(&slabs_lock);
             APPEND_STAT("slab_global_page_pool", "%u", slabclass[SLAB_GLOBAL_PAGE_POOL].slabs);

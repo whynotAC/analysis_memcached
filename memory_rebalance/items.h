@@ -24,7 +24,7 @@ int item_is_flushed(item *it);
  */
 typedef struct {
     int64_t evicted;
-    int64_t autofmemory;
+    int64_t outofmemory;
     uint32_t age;
 } item_stats_automove;
 void fill_item_stats_automove(item_stats_automove *am);
