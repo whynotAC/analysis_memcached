@@ -33,6 +33,12 @@ unsigned int item_lock_hashpower;
 #define hashsize(n) ((unsigned long int)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
+/**
+ * Each libevent instance has a wakeup pipe, which other threads
+ * can use to signal that they've put a new connection on its queue.
+ */
+static LIBEVENT_THREAD *threads;
+
 /*
  * item_lock() must be held for an item before any modifications to either
  * its associated hash bucket, or the structure itself.
@@ -231,6 +237,60 @@ void STATS_LOCK() {
 
 void STATS_UNLOCK() {
     pthread_mutex_unlock(&stats_lock);
+}
+
+void threadlocal_stats_reset(void) {
+    int ii;
+    for (ii = 0; ii < settings.num_threads; ++ii) {
+        pthread_mutex_lock(&threads[ii].stats.mutex);
+#define X(name) threads[ii].stats.name = 0;
+        THREAD_STATS_FIELDS
+#ifdef EXTSTORE
+        EXTSTORE_THREAD_STATS_FIELDS
+#endif
+#undef X
+
+        memset(&threads[ii].stats.slab_stats, 0, 
+                sizeof(threads[ii].stats.slab_stats));
+        memset(&threads[ii].stats.lru_hits, 0,
+                sizeof(uint64_t) * POWER_LARGEST);
+
+        pthread_mutex_unlock(&threads[ii].stats.mutex);
+    }
+}
+
+void threadlocal_stats_aggregate(struct thread_stats *stats) {
+    int ii, sid;
+
+    /* The struct has a mutex, but we can safely set the whole thing
+     * to zero since it is unused when aggregatimg.
+     */
+    memset(stats, 0, sizeof(*stats));
+
+    for (ii = 0; ii < settings.num_threads; ++ii) {
+        pthread_mutex_lock(&threads[ii].stats.mutex);
+#define X(name) stats->name += threads[ii].stats.name;
+        THREAD_STATS_FIELDS
+#ifdef EXTSTORE
+        EXTSTORE_THREAD_STATS_FIELDS
+#endif
+#undef X
+        for (sid = 0; sid < MAX_NUMBER_OF_SLAB_CLASSES; sid++) {
+#define X(name) stats->slab_stats[sid].name += \
+            threads[ii].stats.slab_stats[sid].name;
+            SLAB_STATS_FIELDS
+#undef X
+        }
+
+        for (sid = 0; sid < POWER_LARGEST; sid++) {
+            stats->lru_hits[sid] +=
+                threads[ii].stats.lru_hits[sid];
+            stats->slab_stats[CLEAR_LRU(sid)].get_hits +=
+                threads[ii].stats.lru_hits[sid];
+        }
+
+        pthread_mutex_unlock(&threads[ii].stats.mutex);
+    }
 }
 
 /*
