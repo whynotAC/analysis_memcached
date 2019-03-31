@@ -1,10 +1,14 @@
 #include "memcached.h"
 
 
-#define LARGEST_ID POWER_LARGEST
 
 extern pthread_mutex_t lru_locks[POWER_LARGEST];
+extern stats_state stats_state;
+extern stats stats;
 
+static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU};
+
+#define LARGEST_ID POWER_LARGEST
 typedef struct {
     uint64_t evicted;
     uint64_t evicted_nonzero;
@@ -41,6 +45,30 @@ static int lru_maintainer_initialized = 0;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct {
+    unsigned long int size;
+
+    /* region A */
+    unsigned int a_start, a_end;
+
+    /* region B */
+    unsigned int b_end;
+
+    /* is B inuse? */
+    int b_inuse;
+
+    unsigned char data[];
+} bipbuf_t;
+
+typedef struct _lru_bump_buf {
+    struct _lru_bump_buf *prev;
+    struct _lru_bump_buf *next;
+    pthread_mutex_t mutex;
+    bipbuf_t *buf;
+    uint64_t dropped;
+} lru_bump_buf;
+
+static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv);
 static uint64_t lru_total_bumps_dropped(void) {
     return 0;
 }
@@ -65,6 +93,85 @@ int item_is_flushed(item *it) {
         return 1;
     }
     return 0;
+}
+
+static unsigned int temp_lru_size(int slabs_clsid) {
+    int id = CLEAR_LRU(slabs_clsid);
+    id |= TEMP_LRU;
+    unsigned int ret;
+    pthread_mutex_lock(&lru_locks[id]);
+    ret = sizes_bytes[id];
+    pthread_mutex_unlock(&lru_locks[id]);
+    return ret;
+}
+
+/**
+ * Generates the variable-sized part of the header for an object
+ *
+ * key          - The key
+ * nkey         - The length of the key
+ * flags        - key flags
+ * nbytes       - Number of bytes to hold value and addition CRLF terminator
+ * suffix       - Buffer for the "VALUE" line suffix (flags, size).
+ * nsuffix      - The length of the suffix is stored here.
+ *
+ * Returns the total size of the header.
+ */
+static size_t item_make_header(const uint8_t nkey, const unsigned int flags, 
+        const int nbytes, char *suffix, uint8_t *nsuffix) {
+    if (settings.inline_ascii_response) {
+        *nsuffix = (uint8_t) snprintf(suffix, 40, " %u %d\r\n", flags, nbytes - 2);
+    } else {
+        if (flags == 0) {
+            *nsuffix = 0;
+        } else {
+            *nsuffix = sizeof(flags);
+        }
+    }
+    return sizeof(item) + nkey + *nsuffix + nbytes;
+}
+
+item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
+    item *it = NULL;
+    int i;
+    /**
+     * If no memory is available, attempt a direct LRU juggle/eviction
+     * This is a race in order to simplify lru_pull_tail; in cases where
+     * locked items are on the tail, you want them to fall out and cause
+     * occasional OOM's, rather than internally work around them.
+     * This also gives one fewer code path for slab alloc/free
+     */
+    for (i = 0; i < 10; i++) {
+        uint64_t total_bytes;
+        // Try to reclaim memory first
+        if (!settings.lru_segmented) {
+            lru_pull_tail(id, COLD_LRU, 0, 0, 0, NULL);
+        }
+        it = (item *)slabs_alloc(ntotal, id, &total_bytes, 0);
+
+        if (settings.temp_lru)
+            total_bytes -= temp_lru_size(id);
+
+        if (it == NULL) {
+            if (lru_pull_tail(id, COLD_LRU, total_bytes, LRU_PULL_EVICT, 0, NULL) <= 0) {
+                if (settings.lru_segmented) {
+                    lru_pull_tail(id, HOT_LRU, total_bytes, 0, 0, NULL);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    if (i > 0) {
+        pthread_mutex_lock(&lru_locks[id]);
+        itemstats[id].direct_reclaims += i;
+        pthread_mutex_unlock(&lru_locks[id]);
+    }
+
+    return it;
 }
 
 /* Chain another chunk onto this chunk.
@@ -581,7 +688,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv,
                             it->it_flags |= ITEM_ACTIVE;
                             if (ITEM_lruid(it) != COLD_LRU) {
                                 do_item_update(it); // bump LA time
-                            } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                            } else if (!lru_bump_async((lru_bump_buf *)(c->thread->lru_bump_buf), it, hv)) {
                                 // and flag before async bump to avoid race
                                 it->it_flags &= ~ITEM_ACTIVE;
                             }
@@ -607,6 +714,12 @@ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
     return it;
 }
 
+int lru_pull_tail(const int orig_id, const int cur_lru,
+        const uint64_t total_bytes, const uint8_t flags, 
+        const rel_time_t max_age, struct lru_pull_tail_return *ret_it) {
+    return NULL;
+}
+
 /**
  * With refactoring of the various stats code the automover won't need a 
  * custom function here.
@@ -618,7 +731,7 @@ void fill_item_stats_automove(item_stats_automove *am) {
 
         int i = n | HOT_LRU;
         pthread_mutex_lock(&lru_locks[i]);
-        cur->autofmemory = itemstats[i].outofmemory;
+        cur->outofmemory = itemstats[i].outofmemory;
         pthread_mutex_unlock(&lru_locks[i]);
 
         // evictions and tail age are from COLD
@@ -640,4 +753,8 @@ int init_lru_maintainer(void) {
         lru_maintainer_initialized = 1;
     }
     return 0;
+}
+
+static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
+    return false;
 }

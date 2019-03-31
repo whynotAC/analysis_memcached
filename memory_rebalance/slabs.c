@@ -22,6 +22,7 @@
 
 extern stats_state stats_state;
 extern stats stats;
+extern void threadlocal_stats_aggregate(struct thread_stats *stats);
 
 //#define DEBUG_SLAB_MOVER
 //powers-of-N allocation structures
@@ -627,7 +628,7 @@ unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
     ret = p->sl_curr;
     if (mem_flag != NULL) 
         *mem_flag = mem_malloced >= mem_limit ? true : false;
-    if (tatal_bytes != NULL)
+    if (total_bytes != NULL)
         *total_bytes = p->requested;
     if (chunks_perslab != NULL)
         *chunks_perslab = p->perslab;
@@ -721,12 +722,12 @@ static void *slab_rebalance_alloc(const size_t size, unsigned int id) {
     item *new_it = NULL;
 
     for (x = 0; x < s_cls->perslab; x++) {
-        new_it = do_slabs_alloc(size, id, NULL, SLABS_ALLOC_NO_NEWPAGE);
+        new_it = (item *)do_slabs_alloc(size, id, NULL, SLABS_ALLOC_NO_NEWPAGE);
         // check that memory isn't within the range to clear
         if (new_it == NULL) {
             break;
         }
-        if ((void *)new_it >= slab_reabal.slab_start 
+        if ((void *)new_it >= slab_rebal.slab_start 
             && (void *)new_it < slab_rebal.slab_end) {
             /* Pulled something we intend to free. Mark it as freed since
              * we've already done the work of unlinking it from the freelist.
@@ -797,7 +798,7 @@ static int slab_rebalance_move(void) {
     for (x = 0; x < slab_bulk_check; x++) {
         hv = 0;
         hold_lock = NULL;
-        item *it = slab_rebal.slab_pos;
+        item *it = (item *)slab_rebal.slab_pos;
         item_chunk *ch = NULL;
         status = MOVE_PASS;
         if (it->it_flags & ITEM_CHUNK) {
@@ -827,7 +828,7 @@ static int slab_rebalance_move(void) {
                  * and have the key written to it already.
                  */
                 hv = hash(ITEM_key(it), it->nkey);
-                if ((hold_lock) = item_trylock(hv) == NULL) {
+                if ((hold_lock = item_trylock(hv)) == NULL) {
                     status = MOVE_LOCKED;
                 } else {
                     bool is_linked = (it->it_flags & ITEM_LINKED);
@@ -852,7 +853,9 @@ static int slab_rebalance_move(void) {
                             slab_rebal.busy_deletes++;
                             // Only safe to hold slabs lock because refcount
                             // can't drop to 0 util we release item lock
+#ifdef EXTSTORE
                             STORAGE_delete(storage, it);
+#endif
                             pthread_mutex_unlock(&slabs_lock);
                             do_item_unlink(it, hv);
                             pthread_mutex_lock(&slabs_lock);
@@ -882,7 +885,7 @@ static int slab_rebalance_move(void) {
         item *new_it = NULL;
         size_t ntotal = 0;
         switch (status) {
-            case MOVE_FROM_LRU:
+            case MOVE_FROM_LRU: {
                 /* Lock order is LRU locks -> slabs_lock. unlink uses LRU lock.
                  * We only need to hold the slabs_lock while initially looking
                  * at an item, and at this point we have an exclusive refcount
@@ -907,12 +910,12 @@ static int slab_rebalance_move(void) {
                     // Expired, don't save
                     save_item = 0;
                 } else if (ch == NULL && 
-                        (new_it = slab_rebalance_alloc(ntotal, slab_rebal.clsid)) == NULL) {
+                        (new_it = (item *)slab_rebalance_alloc(ntotal, slab_rebal.s_clsid)) == NULL) {
                     // Not a chunk of an item, and nomem
                     save_item = 0;
                     slab_rebal.evictions_nomem++;
                 } else if (ch != NULL &&
-                        (new_it = slab_rebalance_alloc(s_cls->size, slab_rebal.s_clsid)) == NULL) {
+                        (new_it = (item *)slab_rebalance_alloc(s_cls->size, slab_rebal.s_clsid)) == NULL) {
                     // Is a chunk of an item, and nomem
                     save_item = 0;
                     slab_rebal.evictions_nomem++;
@@ -969,7 +972,9 @@ static int slab_rebalance_move(void) {
                 } else {
                     /* restore ntotal in case we tried saving a head chunk */
                     ntotal = ITEM_ntotal(it);
+#ifdef EXTSTORE
                     STORAGE_delete(storage, it);
+#endif
                     do_item_unlink(it, hv);
                     slabs_free(it, ntotal, slab_rebal.s_clsid);
                     /* Swing around again later to remove it from the freelist */
@@ -982,19 +987,19 @@ static int slab_rebalance_move(void) {
                  * do_slabs_alloc() when copying the item.
                  */
                 s_cls->requested -= requested_adjust;
-                break;
-            case MOVE_FROM_SLAB:
+                } break;
+            case MOVE_FROM_SLAB: {
                 it->refcount = 0;
                 it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
 #ifdef DEBUG_SLAB_MOVER
                 memcpy(ITEM_key(it), "deadbeef", 8);
 #endif
-                break;
+                }break;
             case MOVE_BUSY:
-            case MOVE_LOCKED:
+            case MOVE_LOCKED: {
                 slab_rebal.busy_items++;
                 was_busy++;
-                break;
+                }break;
             case MOVE_PASS:
                 break;
         }
@@ -1065,10 +1070,10 @@ static void slab_rebalance_finish(void) {
     /* Don't need to split the page into chunks if we're just storing it */
     if (slab_rebal.d_clsid > SLAB_GLOBAL_PAGE_POOL) {
         memset(slab_rebal.slab_start, 0, (size_t)settings.slab_page_size);
-        split_slab_page_into_freelist(slab_rebal.slab_start, slab_rebal.d_clsid);
+        split_slab_page_into_freelist((char *)slab_rebal.slab_start, slab_rebal.d_clsid);
     } else if (slab_rebal.d_clsid == SLAB_GLOBAL_PAGE_POOL) {
         /* mem_malloc'ed might be higher than mem_limit */
-        mem_limt_reached = false;
+        mem_limit_reached = false;
         memory_release();
     }
 
@@ -1095,10 +1100,10 @@ static void slab_rebalance_finish(void) {
     pthread_mutex_unlock(&slabs_lock);
 
     STATS_LOCK();
-    stats.slabs_moved++;
+    stats.slabs_move++;
     stats.slab_reassign_rescues += rescues;
     stats.slab_reassign_evictions_nomem += evictions_nomem;
-    stats.slab_reassign_inline_recaim += inline_reclaim;
+    stats.slab_reassign_inline_reclaim += inline_reclaim;
     stats.slab_reassign_chunk_rescues += chunk_rescues;
     stats.slab_reassign_busy_deletes += busy_deletes;
     stats_state.slab_reassign_running = false;
@@ -1140,7 +1145,7 @@ static void *slab_rebalance_thread(void *arg) {
 
         if (slab_rebalance_signal == 0) {
             // always hold this lock while we're running
-            pthread_cond_wait(&slab_rebalance_cond, &slab_rebalance_lock);
+            pthread_cond_wait(&slab_rebalance_cond, &slabs_rebalance_lock);
         }
     }
     return NULL;

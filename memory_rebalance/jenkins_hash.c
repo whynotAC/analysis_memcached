@@ -18,16 +18,16 @@
  * are set in the configure script.
  */
 #if ENDIAN_BIG == 1
-# define HASH_LITTLE_ENDIAN 0
-# define HASH_BIG_ENDIAN 1
+#define HASH_LITTLE_ENDIAN 0
+#define HASH_BIG_ENDIAN 1
 #else
-# if ENDIAN_LITTLE == 1
-#  define HASH_LITTLE_ENDIAN 1
-#  define HASH_BIG_ENDIAN 0
-# else
-#  define HASH_LITTLE_ENDIAN 0
-#  define HASH_BIG_ENDIAN 0
-# endif
+#if ENDIAN_LITTLE == 1
+#define HASH_LITTLE_ENDIAN 1
+#define HASH_BIG_ENDIAN 0
+#else
+#define HASH_LITTLE_ENDIAN 0
+#define HASH_BIG_ENDIAN 0
+#endif
 #endif
 
 #define rot(x,k) (((x)<<(k)) ^ ((x)>>(32-(k))))
@@ -313,7 +313,7 @@ uint32_t jenkins_hash( const void *key, size_t length)
 
   u.ptr = key;
   if (HASH_BIG_ENDIAN && ((u.i & 0x3) == 0)) {
-    const uint32_t *k = key;                           /* read 32-bit chunks */
+    const uint32_t *k = (uint32_t *)key;                           /* read 32-bit chunks */
 #ifdef VALGRIND
     const uint8_t  *k8;
 #endif /* ifdef VALGRIND */
@@ -381,7 +381,7 @@ uint32_t jenkins_hash( const void *key, size_t length)
 #endif /* !VALGRIND */
 
   } else {                        /* need to read the key one byte at a time */
-    const uint8_t *k = key;
+    const uint8_t *k = (uint8_t *)key;
 
     /*--------------- all but the last block: affect some 32 bits of (a,b,c) */
     while (length > 12)

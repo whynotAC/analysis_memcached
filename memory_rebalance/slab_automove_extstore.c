@@ -42,11 +42,11 @@ typedef struct {
 void *slab_automove_extstore_init(struct settings *settings) {
     uint32_t window_size = settings->slab_automove_window;
     double max_age_ratio = settings->slab_automove_ratio;
-    slab_automove *a = calloc(1, sizeof(slab_automove));
+    slab_automove *a = (slab_automove *)calloc(1, sizeof(slab_automove));
     if (a == NULL)
         return NULL;
-    a->window_data = calloc(window_size * MAX_NUMBER_OF_SLAB_CLASSES, sizeof(struct widnow_data));
-    a->window_global = calloc(window_size, sizeof(struct window_global));
+    a->window_data = (window_data *)calloc(window_size * MAX_NUMBER_OF_SLAB_CLASSES, sizeof(struct window_data));
+    a->window_global = (window_global *)calloc(window_size, sizeof(struct window_global));
     a->window_size = window_size;
     a->max_age_ratio = max_age_ratio;
     a->free_ratio = settings->slab_automove_freeratio;
@@ -89,7 +89,7 @@ static void window_sum(struct window_data *wd, struct window_data *w,
 }
 
 // This could potentially merge with above
-static void window_global_sum(struct widnow_global *wg,
+static void window_global_sum(struct window_global *wg,
         struct window_global *w, uint32_t size) {
     for (int x = 0; x < size; x++) {
         struct window_global *d = &wg[x];
@@ -147,8 +147,8 @@ static void memcheck(slab_automove *a) {
     a->free_mem[0] = total_pages * a->free_ratio;
 }
 
-static struct window_data *get_window_data(slab_automove *a, int class) {
-    int w_offset = class * a->window_size;
+static struct window_data *get_window_data(slab_automove *a, int classid) {
+    int w_offset = classid * a->window_size;
     return &a->window_data[w_offset + (a->window_cur % a->window_size)];
 }
 
@@ -184,13 +184,13 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
         // summarize the window-up-to-now.
         memset(&w_sum, 0, sizeof(struct window_data));
         int w_offset = n * a->window_size;
-        window_sum(&a->window_data[w_offset], &w_sum, a->widnow_size);
+        window_sum(&a->window_data[w_offset], &w_sum, a->window_size);
         memset(wd, 0, sizeof(struct window_data));
 
         // if page delta, oom, or evicted delta, mark window dirty
         // classes marked dirty cannot donnate memory back to global pool.
         if (a->iam_after[n].evicted - a->iam_before[n].evicted > 0 || 
-            a->iam_after[n].autofmemory - a->iam_before[n].outofmemory > 0) {
+            a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
             wd->evicted = 1;
             wd->dirty = 1;
         }
@@ -244,7 +244,7 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
                     && w_sum.excess_free < a->window_size
                     && !(w_sum.relaxed && free_enough)) {
                 youngest = n;
-                yougest_age = age;
+                youngest_age = age;
             }
         }
     }
@@ -257,12 +257,12 @@ void slab_automove_extstore_run(void *arg, int *src, int *dst) {
     if (a->window_cur < a->window_size)
         return;
 
-    if (wg_sum.pool_high >= a->widnow_size && !wg_sum.pool_low && youngest != -1) {
+    if (wg_sum.pool_high >= a->window_size && !wg_sum.pool_low && youngest != -1) {
         if (a->sam_after[youngest].free_chunks <= a->free_mem[youngest]) {
             *src = 0;
             *dst = youngest;
         }
-        struct window_data *wd = get_widnow_data(a, youngest);
+        struct window_data *wd = get_window_data(a, youngest);
         // "relaxing" here and below allows us to skip classes which will
         // never grow or are growing slowly, more quickly finding other
         // classes which violate the age ratio.
