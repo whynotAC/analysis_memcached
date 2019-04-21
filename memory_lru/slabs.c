@@ -637,3 +637,629 @@ unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
     pthread_mutex_unlock(&slabs_lock);
     return ret;
 }
+
+/* The slabber system could avoid needing to understand much, if anything,
+ * about items if callbacks were strategically used. Due to how the slab mover
+ * works, certain flag bits can only be adjusted while holding the slabs lock.
+ * Using these functions, isolate sections of code needing this and turn them
+ * into callbacks when an interface becomes more obvious.
+ */
+void slabs_mlock(void) {
+    pthread_mutex_lock(&slabs_lock);
+}
+
+void slabs_munlock(void) {
+    pthread_mutex_unlock(&slabs_lock);
+}
+
+static pthread_cond_t slab_rebalance_cond = PTHREAD_MUTEX_INITIALIZER;
+static volatile int do_run_slab_thread = 1;
+static volatile int do_run_slab_rebalance_thread = 1;
+
+#define DEFAULT_SLAB_BULK_CHECK 1
+int slab_bulk_check = DEFAULT_SLAB_BULK_CHECK;
+
+static int slab_rebalance_start(void) {
+    slabclass_t *s_cls;
+    int no_go = 0;
+
+    pthread_mutex_lock(&slabs_lock);
+
+    if (slab_rebal.s_clsid < SLAB_GLOBAL_PAGE_POOL ||
+        slab_rebal.s_clsid > power_largest ||
+        slab_rebal.d_clsid < SLAB_GLOBAL_PAGE_POOL || 
+        slab_rebal.d_clsid > power_largest ||
+        slab_rebal.s_clsid == slab_rebal.d_clsid)
+      no_go = -2;
+
+    s_cls = &slabclass[slab_rebal.s_clsid];
+
+    if (!grow_slab_list(slab_rebal.d_clsid)) {
+        no_go = -1;
+    }
+
+    if (s_cls->slabs < 2)
+        no_go = -3;
+
+    if (no_go != 0) {
+        pthread_mutex_unlock(&slabs_lock);
+        return no_go;   // Should use a wrapper function....
+    }
+
+    /**
+     * Always kill the first available slab page as it is most likely to 
+     * contain the oldest items
+     */
+    slab_rebal.slab_start = s_cls->slab_list[0];
+    slab_rebal.slab_end = (char *)slab_rebal.slab_start + 
+            (s_cls->size * s_cls->perslab);
+    slab_rebal.slab_pos = slab_rebal.slab_start;
+    slab_rebal.done = 0;
+    // Don't need to do chunk move work if page is in global pool.
+    if (slab_rebal.s_clsid == SLAB_GLOBAL_PAGE_POOL) {
+        slab_rebal.done = 1;
+    }
+
+    slab_rebalance_signal = 2;
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "Started a slab rebalance\n");
+    }
+
+    pthread_mutex_unlock(&slabs_lock);
+
+    STATS_LOCK();
+    stats_state.slab_reassign_running = true;
+    STATS_UNLOCK();
+
+    return 0;
+}
+
+// CALLED WITH slabs_lock held
+static void *slab_rebalance_alloc(const size_t size, unsigned int id) {
+    slabclass_t *s_cls;
+    s_cls = &slabclass[slab_rebal.s_clsid];
+    int x;
+    item *new_it = NULL;
+
+    for (x = 0; x < s_cls->perslab; x++) {
+        new_it = do_slabs_alloc(size, id, NULL, SLABS_ALLOC_NO_NEWPAGE);
+        /* check that memory isn't within the range to clear */
+        if (new_it == NULL) {
+            break;
+        }
+        if ((void *)new_it >= slab_rebal.slab_start 
+            && (void *)new_it < slab_rebal.slab_end) {
+            /* Pulled something we intend to free. Mark it as freed since
+             * we've already done the work of unlinking it from the freelist.
+             */
+            s_cls->requested -= size;
+            new_it->refcount = 0;
+            new_it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+#ifdef DEBUG_SLAB_MOVER
+            memcpy(ITEM_key(new_it), "deadbeef", 8);
+#endif
+            new_it = NULL;
+            slab_rebal.inline_reclaim++;
+        } else {
+            break;
+        }
+    }
+    return new_it;
+}
+
+/* CALLED WITH slabs_lock HELD */
+/* detaches item/chunk from freelist */
+static void slab_rebalance_cut_free(slabclass_t *s_cls, item *it) {
+    /* Ensure this was on the freelist and nothing else. */
+    assert(it->it_flags == ITEM_SLABBED);
+    if (s_cls->slots == it) {
+        s_cls->slots = it->next;
+    }
+    if (it->next) it->next->prev = it->prev;
+    if (it->prev) it->prev->next = it->next;
+    s_cls->sl_curr--;
+}
+
+enum move_status {
+    MOVE_PASS=0, MOVE_FROM_SLAB, MOVE_FROM_LRU, MOVE_BUSY, MOVE_LOCKED
+};
+
+#define SLAB_MOVE_MAX_LOOPS 1000
+
+/* refcount == 0 is safe since nobody can incr while item_lock is held.
+ * refcount != 0 is impossible since flags/etc can be modified in other
+ * threads. instead, note we found a busy one and bail. logic in do_item_get
+ * will prevent busy items from continuing to be busy.
+ * NOTE: This is checking it_flags outside of an item lock. I believe this
+ * works since it_flags is 8 bits, and we're only ever comparing a single bit
+ * regardless. ITEM_SLABBED bit will always be correct since we're between an
+ * item having ITEM_SLABBED removed, and the key hasn't been added to the item
+ * yet. The memory barrier from the slabs lock should order the key write and
+ * the flags to the item?
+ * If ITEM_LINKED did exist and was just removed, but we still see it, that's
+ * still safe since it will have a valid key, which we then lock, and then
+ * recheck everything.
+ * This may not be safe on all platforms; if not, slabs_alloc() will need to
+ * seed the item key while holding slabs_lock.
+ */
+static int slab_rebalance_move(void) {
+    slabclass_t *s_cls;
+    int x;
+    int was_busy = 0;
+    int refcount = 0;
+    uint32_t hv;
+    void *hold_lock;
+    enum move_status status = MOVE_PASS;
+
+    pthread_mutex_lock(&slabs_lock);
+
+    s_cls = &slabclass[slab_rebal.s_clsid];
+
+    for (x = 0; x < slab_bulk_check; x++) {
+        hv = 0;
+        hold_lock = NULL;
+        item *it = slab_rebal.slab_pos;
+        item_chunk *ch = NULL;
+        status = MOVE_PASS;
+        if (it->it_flags & ITEM_CHUNK) {
+            /* This chunk is a chained part of a larger item. */
+            ch = (item_chunk *)it;
+            /* Instead, we use the head chunk to find the item and effectively
+             * lock the entire structure. If a chunk has ITEM_CHUNK flag, its
+             * head cannot be slabbed, so the normal routine is safe
+             */
+            it = ch->head;
+            assert(it->it_flags & ITEM_CHUNKED);
+        }
+
+        /* ITEM_FETCHED when ITEM_SLABBED is overloaded to mean we've cleared
+         * the chunk for move. Only these two flags should exist.
+         */
+        if (it->it_flags != (ITEM_SLABBED|ITEM_FETCHED)) {
+            /* ITEM_SLABBED can only be added/removed under the slabs_lock */
+            if (it->it_flags & ITEM_SLABBED) {
+                assert(ch == NULL);
+                slab_rebalance_cut_free(s_cls, it);
+                status = MOVE_FROM_SLAB;
+            } else if ((it->flags & ITEM_LINKED) != 0) {
+                /* If it doesn't have ITEM_SLABBED, the item could be in any
+                 * state on its way to being freed or written to. If no
+                 * ITEM_SLABBED, but it's had ITEM_LINKED, it must be active
+                 * and have the key written to it already.
+                 */
+                hv = hash(ITEM_key(it), it->nkey);
+                if ((hold_lock = item_trylock(hv)) == NULL) {
+                    status = MOVE_LOCKED;
+                } else {
+                    bool is_linked = (it->it_flags & ITEM_LINKED);
+                    refcount = refcount_incr(it);
+                    if (refcount == 2) {
+                        /* item is linked but not busy
+                         * Double check ITEM_LINKED flag here, since we're
+                         * past a memory barrier from the mutex.
+                         * */
+                        if (is_linked) {
+                            status = MOVE_FROM_LRU;
+                        } else {
+                            /* refcount == 1 + !ITEM_LINKED means the item is
+                             * being uploaded to, or was just unlinked but
+                             * hasn't been freed yet. Let it bleed off on its
+                             * own and try again later
+                             */
+                            status = MOVE_BUSY;
+                        }
+                    } else if (refcount > 2 && is_linked) {
+                        // TODO: Mark items for delete/rescue and process
+                        // outside of the main loop.
+                        if (slab_rebal.busy_loops > SLAB_MOVE_MAX_LOOPS) {
+                            slab_rebal.busy_deletes++;
+                            // Only safe to hold slabs lock because refcount
+                            // can't drop to 0 util we release item lock
+                            STORAGE_delete(storage, it);
+                            pthread_mutex_unlock(&slabs_lock);
+                            do_item_unlink(it, hv);
+                            pthread_mutex_lock(&slabs_lock);
+                        }
+                        status = MOVE_BUSY;
+                    } else {
+                        if (settings.verbose > 2) {
+                            fprintf(stderr, "Slab reassign hit a busy item: refcount : %d (%d -> %d)\n",
+                                it->refcount, slab_rebal.s_clsid, slab_rebal.d_clsid);
+                        }
+                        status = MOVE_BUSY;
+                    }
+                    /* Item lock must be held while modifying refcount */
+                    if (status == MOVE_BUSY) {
+                        refcount_decr(it);
+                        item_trylock_unlock(hold_lock);
+                    }
+                }
+            } else {
+                /* See above comment, No ITEM_SLABBED or ITEM_LINKED. Mark
+                 * busy and wait for item to complete its upload.
+                 */
+                status = MOVE_BUSY;
+            }
+        }
+
+        int save_item = 0;
+        item *new_it = NULL;
+        size_t ntotal = 0;
+        switch (status) {
+            case MOVE_FROM_LRU: {
+                /* Lock order is LRU locks -> slabs_lock. unlink uses LRU lock.
+                 * We only need to hold the slabs_lock while initially looking
+                 * at an item, and at this point we have an exclusive refcount
+                 * (2) + the item is locked. Drop slabs lock, drop item to
+                 * refcount 1 (just our own, then fll through and wipe it
+                 */
+                 /* Check if expired or flushed */
+                 ntotal = ITEM_ntotal(it);
+#ifdef EXTSTORE
+                 if (it->it_flags & ITEM_HDR) {
+                    ntotal = (ntotal - it->nbytes) + sizeof(item_hdr);
+                 }
+#endif
+                 /* REQUIRES slabs_lock: CHECK FOR cls->sl_curr > 0 */
+                 if (ch == NULL && (it->it_flags & ITEM_CHUNKED)) {
+                    /* Chunked should be identical to non-chunked, except we
+                     * need to swap out ntotal for the head-chunk-total. */
+                    ntotal = s_cls->size;
+                 }
+                 if ((it->exptime != 0 && it->exptime < current_time)
+                        || item_is_flushed(it)) {
+                    save_item = 0;
+                 } else if (ch == NULL &&
+                        (new_it = slab_rebalance_alloc(ntotal, slab_rebal.s_clsid)) == NULL) {
+                    /* Not a chunk of an item, and nomem */
+                    save_item = 0;
+                    slab_rebal.evictions_nomem++;
+                 } else if (ch != NULL &&
+                        (new_it = slab_rebalance_alloc(s_cls->size, slab_rebal.s_clsid)) == NULL) {
+                    /* Is a chunk of an item, and nomem */
+                    save_item = 0;
+                    slab_rebal.evictions_nomem++;
+                 } else {
+                    /* Was whatever it was, and we have memory for it. */
+                    save_item = 1;
+                 }
+                 pthread_mutex_unlock(&slabs_lock);
+                 unsigned int requested_adjust = 0;
+                 if (save_item) {
+                    if (ch == NULL) {
+                        assert((new_it->it_flags & ITEM_CHUNKED) == 0);
+                        /* if free memory, memcpy, clear prev/next/h_bucket */
+                        memcpy(new_it, it, ntotal);
+                        new_it->prev = 0;
+                        new_it->next = 0;
+                        new_it->h_next = 0;
+                        /* These are definitely required. else fails assert */
+                        new_it->it_flags &= ~ITEM_LINKED;
+                        new_it->refcount = 0;
+                        do_item_replace(it, new_it, hv);
+                        /* Need to walk the chunks and repoint head. */
+                        if (new_it->it_flags & ITEM_CHUNKED) {
+                            item_chunk *fch = (item_chunk *)ITEM_data(new_it);
+                            fch->next->prev = fch;
+                            while (fch) {
+                                fch->head = new_it;
+                                fch = fch->next;
+                            }
+                        }
+                        it->refcount = 0;
+                        it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+#ifdef DEBUG_SLAB_MOVER
+                        memcpy(ITEM_key(it), "deadbeef", 8);
+#endif
+                        slab_rebal.rescues++;
+                        requested_adjust = ntotal;
+                    } else {
+                        item_chunk *nch = (item_chunk *) new_it;
+                        /* Chunks always have head chunk (the main it)*/
+                        ch->prev->next = nch;
+                        if (ch->next)
+                            ch->next->prev = nch;
+                        memcpy(nch, ch, ch->used + sizeof(item_chunk));
+                        ch->refcount = 0;
+                        ch->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+                        slab_rebal.chunk_rescues++;
+#ifdef DEBUG_SLAB_MOVER
+                        memcpy(ITEM_key((item *)ch), "deadbeef", 8);
+#endif
+                        refcount_decr(it);
+                        requested_adjust = s_cls->size;
+                    }
+                 } else {
+                    /* restore ntotal in case we tried saving a head chunk. */
+                    ntotal = ITEM_ntotal(it);
+                    STORAGE_delete(storage, it);
+                    do_item_unlink(it, hv);
+                    slabs_free(it, ntotal, slab_rebal.s_clsid);
+                    /* Swing around again later to remove it from the freelist */
+                    slab_rebal.busy_items++;
+                    was_busy++;
+                 }
+                 item_trylock_unlock(hold_lock);
+                 pthread_mutex_lock(&slabs_lock);
+                 /* Always remove the ntotal, as we added it in during
+                  * do_slabs_alloc() when copying the item.
+                  */
+                 s_cls->requested -= requested_adjust;
+            } break;
+            case MOVE_FROM_SLAB: {
+                 it->refcount = 0;
+                 it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+#ifdef DEBUG_SLAB_MOVER
+                 memcpy(ITEM_key(it), "deadbeef", 8);
+#endif
+            } break;
+            case MOVE_BUSY:
+            case MOVE_LOCKED: {
+                 slab_rebal.busy_items++;
+                 was_busy++;
+            } break;
+            case MOVE_PASS:
+                break;
+        }
+
+        slab_rebal.slab_pos = (char *)slab_rebal.slab_pos + s_cls->size;
+        if (slab_rebal.slab_pos >= slab_rebal.slab_end)
+            break;
+    }
+
+    if (slab_rebal.slab_pos >= slab_rebal.slab_end) {
+        /* Some items were busy, start again from the top */
+        if (slab_rebal.busy_items) {
+            slab_rebal.slab_pos = slab_rebal.slab_start;
+            STATS_LOCK();
+            stats.slab_reassign_busy_items += slab_rebal.busy_items;
+            STATS_UNLOCK();
+            slab_rebal.busy_items = 0;
+            slab_rebal.busy_loops++;
+        } else {
+            slab_rebal.done++;
+        }
+    }
+
+    pthread_mutex_unlock(&slabs_lock);
+
+    return was_busy;
+}
+
+static void slab_rebalance_finish(void) {
+    slabclass_t *s_cls;
+    slabclass_t *d_cls;
+    int x;
+    uint32_t rescues;
+    uint32_t evictions_nomem;
+    uint32_t inline_reclaim;
+    uint32_t chunk_rescues;
+    uint32_t busy_deletes;
+
+    pthread_mutex_lock(&slabs_lock);
+
+    s_cls = &slabclass[slab_rebal.s_clsid];
+    d_cls = &slabclass[slab_rebal.d_clsid];
+
+#ifdef DEBUG_SLAB_MOVER
+    /* If the algorithm is broken, live items can sneak in. */
+    slab_rebal.slab_pos = slab_rebal.slab_start;
+    while (1) {
+        item *it = slab_rebal.slab_pos;
+        assert(it->it_flags == (ITEM_SLABBED|ITEM_FETCHED));
+        assert(memcmp(ITEM_key(it), "deadbeef", 8) == 0);
+        it->it_flags = ITEM_SLABBED|ITEM_FETCHED;
+        slab_rebal.slab_pos = (char *)slab_rebal.slab_pos + s_cls->size;
+        if (slab_rebal.slab_pos >= slab_rebal.slab_end)
+            break;
+    }
+#endif
+
+    /* At this point the stolen slab is completely clear.
+     * We always kill the "first"/"oldest" slab page in the slab_list, so
+     * shuffle the page list backwards and decrement.
+     */
+    s_cls->slabs--;
+    for (x = 0; x < s_cls->slabs; x++) {
+        s_cls->slab_list[x] = s_cls->slab_list[x+1];
+    }
+
+    d_cls->slab_list[d_cls->slabs++] = slab_rebal.slab_start;
+    /* Don't need to split the page into chunks if we're just storing it */
+    if (slab_rebal.d_clsid > SLAB_GLOBAL_PAGE_POOL) {
+        memset(slab_rebal.slab_start, 0, (size_t)settings.slab_page_size);
+        split_slab_page_into_freelist(slab_rebal.slab_start, slab_rebal.d_clsid);
+    } else if (slab_rebal.d_clsid == SLAB_GLOBAL_PAGE_POOL) {
+        /* mem_malloc'ed might be higher than mem_limit */
+        mem_limit_reached = false;
+        memory_release();
+    }
+
+    slab_rebal.busy_loops   = 0;
+    slab_rebal.done         = 0;
+    slab_rebal.s_clsid      = 0;
+    slab_rebal.d_clsid      = 0;
+    slab_rebal.slab_start   = NULL;
+    slab_rebal.slab_end     = NULL;
+    slab_rebal.slab_pos     = NULL;
+    evictions_nomem         = slab_rebal.evictions_nomem;
+    inline_reclaim          = slab_rebal.inline_reclaim;
+    rescues                 = slab_rebal.rescues;
+    chunk_rescues           = slab_rebal.chunk_rescues;
+    busy_deletes            = slab_rebal.busy_deletes;
+    slab_rebal.evictions_nomem = 0;
+    slab_rebal.inline_reclaim = 0;
+    slab_rebal.rescues = 0;
+    slab_rebal.chunk_rescues = 0;
+    slab_rebal.busy_deletes = 0;
+
+    slab_rebalance_signal = 0;
+
+    pthread_mutex_unlock(&slabs_lock);
+
+    STATS_LOCK();
+    stats.slabs_moved++;
+    stats.slab_reassign_rescues += rescues;
+    stats.slab_reassign_evictions_nomem += evictions_nomem;
+    stats.slab_reassign_inline_reclaim += inline_reclaim;
+    stats.slab_reassign_chunk_rescues += chunk_rescues;
+    stats.slab_reassign_busy_deletes += busy_deletes;
+    stats_state.slab_reassign_running = false;
+    STATS_UNLOCK();
+
+    if (settings.verbose > 2) {
+        fprintf(stderr, "finished a slab move\n");
+    }
+}
+
+/* Slab mover thread
+ * Sits waiting for a condition to jump off and shovel some memory about.
+ */
+static void *slab_rebalance_thread(void *arg) {
+    int was_busy = 0;
+    /* So we first pass into cond_wait with the mutex held */
+    mutex_lock(&slabs_rebalance_lock);
+
+    while (do_run_slab_rebalance_thread) {
+        if (slab_rebalance_signal == 1) {
+            if (slab_rebalance_start() < 0) {
+                /* Handle errors with more specificity as required */
+                slab_rebalance_signal = 0;
+            }
+
+            was_busy = 0;
+        } else if (slab_rebalance_signal && slab_rebal.slab_start != NULL) {
+            was_busy = slab_rebalance_move();
+        }
+
+        if (slab_rebal.done) {
+            slab_rebalance_finish();
+        } else if (was_busy) {
+            /* Stuck waiting for some items to unlock, so slow down a bit
+             * to give them a chance to free up */
+            usleep(1000);
+        }
+
+        if (slab_rebalance_signal == 0) {
+            /* always hold this lock while we're running */
+            pthread_cond_wait(&slab_rebalance_cond, &slab_rebalance_lock);
+        }
+    }
+    return NULL;
+}
+
+/* Iterate at most once throught the slab classes and pick a "random" source
+ * I like this better than calling rand() since rand() is slow enough that we
+ * can just check all of the classes once instread.
+ */
+static int slabs_reassign_pick_any(int dst) {
+    static int cur = POWER_SMALLEST - 1;
+    int tries = power_largest - POWER_SMALLEST + 1;
+    for (; tries > 0; tries--) {
+        cur++;
+        if (cur > power_largest)
+            cur = POWER_SMALLEST;
+        if (cur == dst)
+            continue;
+        if (slabclass[cur].slabs > 1) {
+            return cur;
+        }
+    }
+    return -1;
+}
+
+static enum reassign_result_type do_slabs_reassign(int src, int dst) {
+    bool nospare = false;
+    if (slab_rebalance_signal != 0)
+        return REASSIGN_RUNNING;
+
+    if (src == dst)
+        return REASSIGN_SRC_DST_SAME;
+
+    /* Special indicator to choose ourselves */
+    if (src == -1) {
+        src = slabs_reassign_pick_any(dst);
+        /*TODO: If we end up back at -1, return a new error type */
+    }
+
+    if (src < SLAB_GLOBAL_PAGE_POOL || src > power_largest ||
+        dst < SLAB_GLOBAL_PAGE_POOL || dst > power_largest)
+      return REASSIGN_BADCLASS;
+
+    pthread_mutex_lock(&slabs_lock);
+    if (slabclass[src].slabs < 2)
+        nospare = true;
+    pthread_mutex_unlock(&slabs_lock);
+    if (nospare)
+        return REASSIGN_NOSPARE;
+
+    slab_rebal.s_clsid = src;
+    slab_rebal.d_clsid = dst;
+
+    slab_rebalance_signal = 1;
+    pthread_cond_signal(&slab_rebalance_cond);
+
+    return REASSIGN_OK;
+}
+
+enum readssign_result_type slabs_reassign(int src, int dst) {
+    enum reassign_result_type ret;
+    if (pthread_mutex_trylock(&slabs_rebalance_lock) != 0) {
+        return REASSIGN_RUNNING;
+    }
+    ret = do_slabs_reassign(src, dst);
+    pthread_mutex_unlock(&slabs_rebalance_lock);
+    return ret;
+}
+
+/* If we hold this lock, rebalancer can't wake up or move */
+void slabs_rebalancer_pause(void) {
+    pthread_mutex_lock(&slabs_rebalance_lock);
+}
+
+void slabs_rebalancer_resume(void) {
+    pthread_mutex_unlock(&slabs_rebalance_lock);
+}
+
+static pthread_t rebalance_tid;
+
+int start_slab_maintenance_thread(void) {
+    int ret;
+    slab_rebalance_signal = 0;
+    slab_rebal.slab_start = NULL;
+    char *env = getenv("MEMCACHED_SLAB_BULK_CHECK");
+    if (env != NULL) {
+        slab_bulk_check = atoi(env);
+        if (slab_bulk_check == 0) {
+            slab_bulk_check = DEFAULT_SLAB_BULK_CHECK;
+        }
+    }
+
+    if (pthread_cond_init(&slab_rebalance_cond, NULL) != 0) {
+        fprintf(stderr, "Can't initialize rebalance condition\n");
+        return -1;
+    }
+    pthread_mutex_init(&slabs_rebalance_lock, NULL);
+
+    if ((ret = pthread_create(&rebalance_tid, NULL,
+                                slab_rebalance_thread, NULL)) != 0) {
+        fprintf(stderr, "Can't create rebal thread: %s\n", strerror(ret));
+        return -1;
+    }
+    return 0;
+}
+
+/* The maintenance thread is on a sleep/loop cycle, so it should join after a
+ * short wait
+ */
+void stop_slab_maintenance_thread(void) {
+    mutex_lock(&slab_rebalance_lock);
+    do_run_slab_thread = 0;
+    do_run_slab_rebalance_thread = 0;
+    pthread_cond_signal(&slab_rebalance_cond);
+    pthread_mutex_unlock(&slab_rebalance_lock);
+
+    /* Wait for the maintenance thread to stop */
+    pthread_join(rebalance_tid, NULL);
+}
