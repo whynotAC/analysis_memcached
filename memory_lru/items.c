@@ -390,3 +390,269 @@ static void do_item_link_q(item *it) { // item is the new head
 
     return;
 }
+
+static void item_link_q(item *it) {
+    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    do_item_link_q(it);
+    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+}
+
+static void item_link_q_warm(item *it) {
+    pthread_mutex_lock[&lru_locks[it->slabs_clsid]];
+    do_item_link_q(it);
+    itemstats[it->slabs_clsid].moves_to_warm++;
+    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+}
+
+static void do_item_unlink_q(item *it) {
+    item **head, **tail;
+    head = &heads[it->slabs_clsid];
+    tail = &tails[it->slabs_clsid];
+
+    if (*head == it) {
+        assert(it->prev == 0);
+        *head = it->next;
+    }
+
+    if (*tail == it) {
+        assert(it->next == 0);
+        *tail = it->prev;
+    }
+    assert(it->next != it);
+    assert(it->prev != it);
+
+    if (it->next) it->next->prev = it->prev;
+    if (it->prev) it->prev->next = it->next;
+    sizes[it->slabs_clsid]--;
+#ifdef EXTSTORE
+    if (it->it_flags & ITEM_HDR) {
+        sizes_bytes[it->slabs_clsid] -= (ITEM_ntotal(it) - it->nbytes) + sizeof(item_hdr);
+    } else {
+        sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+    }
+#else 
+    sizes_bytes[it->slabs_clsid] -= ITEM_ntotal(it);
+#endif
+
+    return;
+}
+
+static void item_unlink_q(item *it) {
+    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    do_item_unlink_q(it);
+    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+}
+
+int do_item_link(item *it, const uint32_t hv) {
+    MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
+    assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+    it->it_flags |= ITEM_LINKED;
+    it->time = current_time;
+
+    STATS_LOCK();
+    stats_state.curr_bytes += ITEM_ntotal(it);
+    stats_state.curr_items += 1;
+    stats.total_items += 1;
+    STATS_UNLOCK();
+
+    /* Allocate a new CAS ID on link. */
+    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+    assoc_insert(it, hv);
+    item_link_q(it);
+    refcount_incr(it);
+    item_stats_sizes_add(it);
+
+    return 1;
+}
+
+void do_item_unlink(item *it, const uint32_t hv) {
+    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+    if ((it->it_flags & ITEM_LINKED) != 0) {
+        it->it_flags &= ~ITEM_LINKED;
+        STATS_LOCK();
+        stats_state.curr_bytes -= ITEM_ntotal(it);
+        stats_state.curr_items -= 1;
+        STATS_UNLOCK();
+        item_stats_sizes_remove(it);
+        assoc_delete(ITEM_key(it), it->nkey, hv);
+        item_unlink_q(it);
+        do_item_remove(it);
+    }
+}
+
+/* FIXME: Is it necessary to keep this copy/pasted code? */
+void do_item_unlink_nolock(item *it, const uint32_t hv) {
+    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+    if ((it->it_flags & ITEM_LINKED) != 0) {
+        it->it_flags &= ~ITEM_LINKED;
+        STATS_LOCK();
+        stats_state.curr_bytes -= ITEM_ntotal(it);
+        stats_state.curr_items -= 1;
+        STATS_UNLOCK();
+        item_stats_sizes_remove(it);
+        assoc_delete(ITEM_key(it), it->nkey, hv);
+        do_item_unlink_q(it);
+        do_item_remove(it);
+    }
+}
+
+void do_item_remove(item *it) {
+    MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
+    assert((it->it_flags & ITEM_SLABBED) == 0);
+    assert(it->refcount > 0);
+
+    if (refcount_decr(it) == 0) {
+        item_free(it);
+    }
+}
+
+/* Copy/paste to avoid adding two extra branches for all common calls, since
+ * _nolock is only used in on uncommon case where we want to relink. */
+void do_item_update_nolock(item *it) {
+    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            do_item_unlink_q(it);
+            it->time = current_time;
+            do_item_link_q(it);
+        }
+    }
+}
+
+/* Bump the last accessed time, or relink if we're in compat mode */
+void do_item_update(item *it) {
+    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
+
+    /* Hits to COLD_LRU immediately move to WARM */
+    if (settings.lru_segmented) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            if (ITEM_lruid(it) == COLD_LRU && (it->it_flags & ITEM_ACTIVE)) {
+                it->time = current_time;
+                item_unlink_q(it);
+                it->slabs_clsid = ITEM_clsid(it);
+                it->slabs_clsid |= WARM_LRU;
+                it->it_flags &= ~ITEM_ACTIVE;
+                item_link_q_warm(it);
+            } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+                it->time = current_time;
+            }
+        }
+    } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+
+        if ((it->it_flags & ITEM_LINKED) != 0) {
+            it->time = current_time;
+            item_unlink_q(it);
+            item_link_q(it);
+        }
+    }
+}
+
+int do_item_replace(item *it, item *new_it, const uint32_t hv) {
+    MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
+                            ITEM_key(new_it), new_it->nkey, new_it->nbytes);
+    assert((it->it_flags & ITEM_SLABBED) == 0);
+
+    do_item_unlink(it, hv);
+    return do_item_link(new_it, hv);
+}
+
+/*@null@*/
+/* This is walking the line of violating lock order, but I think it's safe.
+ * If the LRU lock is held, an item in the LRU cannot be wiped and freed.
+ * The data could possibly be overwritten, but this is only accessing the 
+ * headers.
+ * It may not be the best idea to leave it like this, but for now it's safe.
+ */
+char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes) {
+    unsigned int memlimit = 2 * 1024 * 1024; /* 2MB max response size */
+    char *buffer;
+    unsigned int bufcurr;
+    item *it;
+    unsigned int len;
+    unsigned int shown = 0;
+    char key_temp[KEY_MAX_LENGTH + 1];
+    char temp[512];
+    unsigned int id = slabs_clsid;
+    id |= COLD_LRU;
+
+    pthread_mutex_lock(&lru_locks[id]);
+    it = heads[id];
+
+    buffer = malloc((size_t)memlimit);
+    if (buffer == 0) {
+        return NULL;
+    }
+    bufcurr = 0;
+
+    while (it != NULL && (limit == 0 || shown < limit)) {
+        assert(it->nkey <= KEY_MAX_LENGTH);
+        if (it->nbytes == 0 && it->nkey == 0) {
+            it = it->next;
+            continue;
+        }
+        /* Copy the key since it may not be null-terminated in the struct */
+        strncpy(key_temp, ITEM_key(it), it->nkey);
+        key_temp[it->nkey] = 0x00;  /* terminate */
+        len = snprintf(temp, sizeof(temp), "ITEM %s [%d b; %llu s]\r\n",
+                        key_temp, it->nbytes - 2,
+                        it->exptime == 0 ? 0 : 
+                        (unsigned long long)it->exptime + process_started);
+        if (buffer + len + 6 > memlimit)    /* 6 is END\n\0*/
+            break;
+        memcpy(buffer + bufcurr, temp, len);
+        bufcurr += len;
+        shown++;
+        it = it->next;
+    }
+
+    memcpy(buffer + bufcurr, "END\r\n", 6);
+    bufcurr += 5;
+    
+    *bytes = bufcurr;
+    pthread_mutex_unlock(&lru_locks[id]);
+    return buffer;
+}
+
+/* With refactoring of the various stats code the automover won't need a 
+ * custom function here.
+ */
+void fill_item_stats_automove(item_stats_automove *am) {
+    int n;
+    for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+        item_stats_automove *cur = &am[n];
+
+        // outofmemory records into HOT
+        int i = n | HOT_LRU;
+        pthread_mutex_lock(&lru_locks[i]);
+        cur->outofmemory = itemstats[i].outofmemory;
+        pthread_mutex_unlock(&lru_locks[i]);
+
+        // evictions and tail age are from COLD
+        i = n | COLD_LRU;
+        pthread_mutex_lock(&lru_locks[i]);
+        cur->evicted = itemstats[i].evicted;
+        if (tails[i]) {
+            cur->age = current_time - tails[i]->time;
+        } else {
+            cur->age = 0;
+        }
+        pthread_mutex_unlock(&lru_locks[i]);
+    }
+}
+
+void item_stats_totals(ADD_STAT add_stats, void *c) {
+    itemstats_t totals;
+    memset(&totals, 0, sizeof(itemstats_t));
+    int n;
+    for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+        int x;
+        int i;
+        for (x = 0; x < 4; x++) {
+            
+        }
+    }
+}
