@@ -652,7 +652,304 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
         int x;
         int i;
         for (x = 0; x < 4; x++) {
-            
+            i = n | lru_type_map[x];
+            pthread_mutex_lock(&lru_locks[i]);
+            totals.expired_unfetched += itemstats[i].expired_unfetched;
+            totals.evicted_unfetched += itemstats[i].evicted_unfetched;
+            totals.evicted_ative += itemstats[i].evicted_ative;
+            totals.evicted += itemstats[i].evicted;
+            totals.reclaimed += itemstats[i].reclaimed;
+            totals.crawler_reclaimed += itemstats[i].crawler_reclaimed;
+            totals.crawler_items_checked += itemstats[i].crawler_items_checked;
+            totals.lrutail_reflocked += itemstats[i].lrutail_reflocked;
+            totals.moves_to_cold += itemstats[i].moves_to_cold;
+            totals.moves_to_warm += itemstats[i].moves_to_warm;
+            totals.moves_within_lru += itemstats[i].moves_within_lru;
+            totals.direct_reclaims += itemstats[i].direct_reclaims;
+            pthread_mutex_unlock(&lru_locks[i]);
         }
+    }
+    APPEND_STAT("expired_unfetched", "%llu", 
+                (unsigned long long)totals.expired_unfetched);
+    APPEND_STAT("evicted_unfetched", "%llu",
+                (unsigned long long)totals.evicted_unfetched);
+    if (settings.lru_maintainer_thread) {
+        APPEND_STAT("evicted_active", "%llu",
+                    (unsigned long long)totals.evicted_active);
+    }
+    APPEND_STAT("evictions", "%llu",
+                (unsigned long long)totals.evicted);
+    APPEND_STAT("reclaimed", "%llu",
+                (unsigned long long)totals.reclaimed);
+    APPEND_STAT("crawler_reclaimed", "%llu",
+                (unsigned long long)totals.crawler_reclaimed);
+    APPEND_STAT("crawler_items_checked", "%llu",
+                (unsigned long long)totals.crawler_items_checked);
+    APPEND_STAT("lrutail_reflocked", "%llu",
+                (unsigned long long)totals.lrutail_reflocked);
+    if (settings.lru_maintainer_thread) {
+        APPEND_STAT("moves_to_cold", "%llu",
+                (unsigned long long)totals.moves_to_cold);
+        APPEND_STAT("moves_to_warm", "%llu",
+                (unsigned long long)totals.moves_to_warm);
+        APPEND_STAT("moves_within_lru", "%llu",
+                (unsigned long long)totals.moves_within_lru);
+        APPEND_STAT("direct_reclaims", "%llu",
+                (unsigned long long)totals.direct_reclaims);
+        APPEND_STAT("lru_bumps_dropped", "%llu",
+                (unsigned long long)lru_total_bumps_dropped());
+}
+
+void item_stats(ADD_STAT add_stats, void *c) {
+    struct thread_stats thread_stats;
+    threadlocal_stats_aggregate(&thread_stats);
+    itemstats_t totals;
+    int n;
+    for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+        memset(&totals, 0, sizeof(itemstats_t));
+        int x;
+        int i;
+        unsigned int size = 0;
+        unsigned int age  = 0;
+        unsigned int age_hot = 0;
+        unsigned int age_warm = 0;
+        unsigned int lru_size_map[4];
+        const char *fmt = "items:%d:%s";
+        char key_str[STAT_KEY_LEN];
+        char val_str[STAT_VAL_LEN];
+        int klen = 0, vlen = 0;
+        for (x = 0; x < 4; x++) {
+            i = n | lru_type_map[x];
+            pthread_mutex_lock(&lru_locks[i]);
+            totals.evicted += itemstats[i].evicted;
+            totals.evicted_nonzero += itemstats[i].evicted_nonzero;
+            totals.outofmemory += itemstats[i].outofmemory;
+            totals.tailrepairs += itemstats[i].tailrepairs;
+            totals.reclaimed += itemstats[i].reclaimed;
+            totals.expired_unfetched += itemstats[i].expired_unfetched;
+            totals.evicted_unfetched += itemstats[i].evicted_unfetched;
+            totals.evicted_active += itemstats[i].evicted_active;
+            totals.crawler_reclaimed += itemstats[i].crawler_reclaimed;
+            totals.crawler_items_checked += itemstats[i].crawler_items_checked;
+            totals.lrutail_reflocked += itemstats[i].lrutail_reflocked;
+            totals.moves_to_cold += itemstats[i].moves_to_cold;
+            totals.moves_to_warm += itemstats[i].moves_to_warm;
+            totals.moves_within_lru += itemstats[i].moves_within_lru;
+            totals.direct_reclaims += itemstats[i].direct_reclaims;
+            size += sizes[i];
+            lru_size_map[x] = sizes[i];
+            if (lru_type_map[x] == COLD_LRU && tails[i] != NULL) {
+                age = current_time - tails[i]->time;
+            } else if (lru_type_map[x] == HOT_LRU && tails[i] != NULL) {
+                age_hot = current_time - tails[i]->time;
+            } else if (lru_type_map[x] == WARM_LRU && tails[i] != NULL) {
+                age_warm = current_time - tails[i]->time;
+            }
+            if (lru_type_map[x] == COLD_LRU)
+                totals.evicted_time = itemstats[i].evicted_time;
+            switch (lru_type_map[x]) {
+                case HOT_LRU:
+                    totals.hits_to_hot = thread_stats.lru_hits[i];
+                    break;
+                case WARM_LRU:
+                    totals.hits_to_warm = thread_stats.lru_hits[i];
+                    break;
+                case COLD_LRU:
+                    totals.hits_to_cold = thread_stats.lru_hits[i];
+                    break;
+                case TEMP_LRU:
+                    totals.hits_to_temp = thread_stats.lru_hits[i];
+                    break;
+            }
+            pthread_mutex_unlock(&lru_locks[i]);
+        }
+        if (size == 0)
+            continue;
+        APPEND_NUM_FMT_STAT(fmt, n, "number", "%u", size);
+        if (settings.lru_maintainer_thread) {
+            APPEND_NUM_FMT_STAT(fmt, n, "number_hot", "%u", lru_size_map[0]);
+            APPEND_NUM_FMT_STAT(fmt, n, "number_warm", "%u", lru_size_map[1]);
+            APPEND_NUM_FMT_STAT(fmt, n, "number_cold", "%u", lru_size_map[2]);
+            if (settings.temp_lru) {
+                APPEND_NUM_FMT_STAT(fmt, n, "number_temp", "%u", lru_size_map[3]);
+            }
+            APPEND_NUM_FMT_STAT(fmt, n, "age_hot", "%u", age_hot);
+            APPEND_NUM_FMT_STAT(fmt, n, "age_warm", "%u", age_warm);
+        }
+        APPEND_NUM_FMT_STAT(fmt, n, "age", "%u", age);
+        APPEND_NUM_FMT_STAT(fmt, n, "evicted",
+                            "%llu", (unsigned long long)totals.evicted);
+        APPEND_NUM_FMT_STAT(fmt, n, "evicted_nonzero",
+                            "%llu", (unsigned long long)totals.evicted_nonzero);
+        APPEND_NUM_FMT_STAT(fmt, n, "evicted_time",
+                            "%u", totals.evicted_time);
+        APPEND_NUM_FMT_STAT(fmt, n, "outofmemory",
+                            "%llu", (unsigned long long)totals.outofmemory);
+        APPEND_NUM_FMT_STAT(fmt, n, "tailrepairs",
+                            "%llu", (unsigned long long)totals.tailrepairs);
+        APPEND_NUM_FMT_STAT(fmt, n, "reclaimed",
+                            "%llu", (unsigned long long)totals.reclaimed);
+        APPEND_NUM_FMT_STAT(fmt, n, "expired_unfetched",
+                            "%llu", (unsigned long long)totals.expired_unfetched);
+        APPEND_NUM_FMT_STAT(fmt, n, "evicted_unfetched",
+                            "%llu", (unsigned long long)totals.evicted_unfetched);
+        if (settings.lru_maintainer_thread) {
+            APPEND_NUM_FMT_STAT(fmt, n, "evicted_active",
+                                "%llu", (unsigned long long)totals.evicted_active);
+        }
+        APPEND_NUM_FMT_STAT(fmt, n, "crawler_reclaimed",
+                            "%llu", (unsigned long long)totals.crawler_reclaimed);
+        APPEND_NUM_FMT_STAT(fmt, n, "crawler_items_checked",
+                            "%llu", (unsigned long long)totals.crawler_items_checked);
+        APPEND_NUM_FMT_STAT(fmt, n, "lrutail_reflocked",
+                            "%llu", (unsigned long long)totals.lrutail_reflocked);
+        if (settings.lru_maintainer_thread) {
+            APPEND_NUM_FMT_STAT(fmt, n, "moves_to_cold",
+                                "%llu", (unsigned long long)totals.moves_to_cold);
+            APPEND_NUM_FMT_STAT(fmt, n, "moves_to_warm",
+                                "%llu", (unsigned long long)totals.moves_to_warm);
+            APPEND_NUM_FMT_STAT(fmt, n, "moves_within_lru",
+                                "%llu", (unsigned long long)totals.moves_within_lru);
+            APPEND_NUM_FMT_STAT(fmt, n, "direct_reclaims",
+                                "%llu", (unsigned long long)totals.direct_reclaims);
+            APPEND_NUM_FMT_STAT(fmt, n, "hits_to_hot",
+                                "%llu", (unsigned long long)totals.hits_to_hot);
+
+            APPEND_NUM_FMT_STAT(fmt, n, "hits_to_warm",
+                                "%llu", (unsigned long long)totals.hits_to_warm);
+
+            APPEND_NUM_FMT_STAT(fmt, n, "hits_to_cold",
+                                "%llu", (unsigned long long)totals.hits_to_cold);
+
+            APPEND_NUM_FMT_STAT(fmt, n, "hits_to_temp",
+                                "%llu", (unsigned long long)totals.hits_to_temp);
+
+        }
+    }
+
+    /* getting here means both ascii and binary terminators fit */
+    add_stats(NULL, 0, NULL, 0, c);
+}
+
+bool item_stats_sizes_status(void) {
+    bool ret = false;
+    mutex_lock(&stats_sizes_lock);
+    if (stats_sizes_hist != NULL)
+        ret = true;
+    mutex_unlock(&stats_sizes_lock);
+    return ret;
+}
+
+void item_stats_sizes_init(void) {
+    if (stats_sizes_hist != NULL)
+        return;
+    stats_sizes_buckets = settings.item_size_max / 32 + 1;
+    stats_sizes_hist = calloc(stats_sizes_buckets, sizeof(int));
+    stats_sizes_cas_min = (settings.use_cas) ? get_cas_id() : 0;
+}
+
+void item_stats_sizes_enable(ADD_STAT add_stats, void *c) {
+    mutex_lock(&stats_sizes_lock);
+    if (!settings.use_cas) {
+        APPEND_STAT("sizes_status", "error", "");
+        APPEND_STAT("sizes_error", "cas_support_disabled", "");
+    } else if (stats_sizes_hist == NULL) {
+        item_stats_sizes_init();
+        if (stats_sizes_hist != NULL) {
+            APPEND_STAT("sizes_status", "enabled", "");
+        } else {
+            APPEND_STAT("sizes_status", "error", "");
+            APPEND_STAT("sizes_error", "no_memory", "");
+        }
+    } else {
+        APPEND_STAT("sizes_status", "enabled", "");
+    }
+    mutex_unlock(&stats_sizes_lock);
+}
+
+void item_stats_sizes_disable(ADD_STAT add_stats, void *c) {
+    mutex_lock(&stats_sizes_lock);
+    if (stats_sizes_hist != NULL) {
+        free(stats_sizes_hist);
+        stats_sizes_hist = NULL;
+    }
+    APPEND_STAT("sizes_status", "disabled", "");
+    mutex_unlock(&stats_sizes_lock);
+}
+
+void item_stats_sizes_add(item *it) {
+    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+        return;
+    int ntotal = ITEM_ntotal(it);
+    int bucket = ntotal / 32;
+    if ((ntotal % 32) != 0) bucket++;
+    if (bucket < stats_sizes_buckets) stats_sizes_hist[bucket]++;
+}
+
+/* I think there's no way for this to be accurate without using the CAS value.
+ * Since items getting their time value bunped will pass this validation.
+ */
+void item_stats_sizes_remove(item *it) {
+    if (stats_sizes_hist == NULL || stats_sizes_cas_min > ITEM_get_cas(it))
+        return;
+    int ntotal = ITEM_ntotal(it);
+    int bucket = ntotal / 32;
+    if ((ntotal % 32) != 0) bucket++;
+    if (bucet < stats_sizes_bucets) stats_sizes_hist[bucket]--;
+}
+
+/** dumps out a list of objects of each size, with granularity of 32 bytes */
+/*@null*/
+/* Locks are correct based on a technicality. Holds LRU lock while doing the 
+ * work, so items can't go invalid, and it's only looking at header sizes
+ * which don't change.
+ */
+void item_stats_sizes(ADD_STAT add_stats, void *c) {
+    mutex_lock(&stats_sizes_lock);
+
+    if (stats_sizes_hist != NULL) {
+        int i;
+        for (i = 0; i < stats_sizes_buckets; i++) {
+            if (stats_sizes_hist[i] != 0) {
+                char key[12];
+                snprintf(key, sizeof(key), "%d", i * 32);
+                APPEND_STAT(key, "%u", stats_sizes_hist[i]);
+            }
+        }
+    } else {
+        APPEND_STAT("sizes_status", "disabled", "");
+    }
+
+    add_stats(NULL, 0, NULL, 0, c);
+    mutex_unlock(&stats_sizes_lock);
+}
+
+/** wrapper around assoc_find which does the lazy expiration logic */
+item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c, const bool do_update) {
+    item *it = assoc_find(key, nkey, hv);
+    if (it != NULL) {
+        refcount_incr(it);
+        /* Optimization for slab reassignment. prevents popular items from
+         * jamming in busy wait. Can only do this here to satisfy lock order
+         * of items_lock, slabs_lock. */
+        /* This was made unsafe by removal of the cache_lock;
+         * slab_rebalance_signal and slab_rebal.* are modified in a separate
+         * thread under slabs_lock. If slab_rebalance_signal = 1, slab_start =
+         * NULL (0), but slab_end is still equal to some value, this would end
+         * up unlinking every item fetched.
+         * This is either an acceptable loss, of if slab_rebalance_signal is
+         * true, slab_start/slab_end should be put behind the slabs_lock.
+         * Which would case a huge potential slowndown.
+         * Could also use a specific lock for slab_rebl.* and
+         * slab_rebalance_signal (shorter lock?)
+         */
+         /* if (slab_rebalance_signal &&
+          *         ((void *)it >= slab_rebal.slab_start && (void *)it <
+          *         slab_rebal.slab_end)) {
+          *     do_item_unlink(it, hv);
+          *     do_item_remove(it);
+          *     it = NULL;
+          * }
+          */
     }
 }
