@@ -952,4 +952,34 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
           * }
           */
     }
+    int was_found = 0;
+
+    if (settings.verbose > 2) {
+        int ii;
+        if (it == NULL) {
+            fprintf(stderr, "> NOT FOUND ");
+        } else {
+            fprintf(stderr, "> FOUND KEY ");
+        }
+        for (ii = 0; ii < nkey; ++ii) {
+            fprintf(stderr, "%c", key[ii]);
+        }
+    }
+
+    if (it != NULL) {
+        was_found = 1;
+        if (item_is_flushed(it)) {
+            do_item_unlink(it, hv);
+            STORAGE_delete(c->thread->storage, it);
+            do_item_remove(it);
+            it = NULL;
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.get_flushed++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+            if (settings.verbose > 2) {
+                fprintf(stderr, " -nuked by flush ");
+            }
+            was_found = 2;
+        }
+    }
 }
