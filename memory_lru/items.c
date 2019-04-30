@@ -980,6 +980,186 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, conn *c
                 fprintf(stderr, " -nuked by flush ");
             }
             was_found = 2;
+        } else if (it->exptime != 0 && it->exptime <= current_time) {
+            do_item_unlink(it, hv);
+            STORAGE_delete(c->thread->storage, it);
+            do_item_remove(it);
+            it = NULL;
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.get_expired++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+            if (settings.verbose > 2) {
+                fprintf(stderr, " -nuked by expire");
+            }
+            was_found = 3;
+        } else {
+            if (do_update) {
+                /* We update the hit markers only during fetches.
+                 * An item needs to be hit twice overall to be considered
+                 * ACTIVE, but only needs a signle hit to maintain activity
+                 * afterward.
+                 * FETCHED tells if an item was ever been active.
+                 */
+                if (settings.lru_segmented) {
+                    if ((it->it_flags & ITEM_ACTIVE) == 0) {
+                        if ((it->it_flags & ITEM_FETCHED) == 0) {
+                            it->it_flags |= ITEM_FETCHED;
+                        } else {
+                            it->it_flags |= ITEM_ACTIVE;
+                            if (ITEM_lruid(it) != COLD_LRU) {
+                                do_item_update(it); // bump LA time
+                            } else if (!lru_bump_async(c->thread->lru_bump_buf, it, hv)) {
+                                // add flag before async bump to avoid race.
+                                it->it_flags &= ~ITEM_ACTIVE;
+                            }
+                        }
+                    }
+                } else {
+                    it->it_flags |= ITEM_FETCHED;
+                    do_item_update(it);
+                }
+            }
+            DEBUG_REFCNT(it, '+');
+        }
+    }
+
+    if (settings.verbose > 2)
+        fprintf(stderr, "\n");
+    /* For now this is in addition to the above verbose logging */
+    LOGGER_LOG(c->thread->l, LOG_FETCHERS, LOGGER_ITEM_GET, NULL, was_found, key, nkey,
+                (it) ? ITEM_clsid(it) : 0);
+
+    return it;
+}
+
+item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
+                    const uint32_t hv, conn *c) {
+    item *it = do_item_get(key, nkey, hv, c, DO_UPDATE);
+    if (it != NULL) {
+        it->exptime = exptime;
+    }
+    return it;
+}
+
+/*** LRU MAINTENANACE THREAD ***/
+
+/* Returns number of items remove, expired, or evicted.
+ * Callable from worker threads or the LRU maintainer thread. */
+int lru_pull_tail(const int orig_id, const int cur_lru,
+        const uint64_t total_bytes, const uint8_t flags, const rel_time_t max_age,
+        struct lru_pull_tail_return *ret_it) {
+    item *it = NULL;
+    int id = orig_id;
+    int removed = 0;
+    if (id == 0)
+        return 0;
+
+    int tries = 5;
+    item *search;
+    item *next_it;
+    void *hold_lock = NULL;
+    unsigned int move_to_lru = 0;
+    uint64_t limit = 0;
+
+    id |= cur_lru;
+    pthread_mutex_lock(&lru_locks[id]);
+    search = tails[id];
+    /* We walk up *only* for locked items, and if bottom is expired. */
+    for (; tries > 0 && search != NULL; tries--, search=next_it) {
+        /* we might relink search mid-loop, so search->prev isn't reliable */
+        next_it = search->prev;
+        if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
+            /* We are a crawler, ignore it. */
+            if (flags & LRU_PULL_CRAWL_BLOCKS) {
+                pthread_mutex_unlock(&lru_locks[id]);
+                return 0;
+            }
+            tries++;
+            continue;
+        }
+        uint32_t hv = hash(ITEM_key(search), search->nkey);
+        /* Attempt to hash item lock the "search" item. If locked, no
+         * other callers can incr the refcount. Alse skip ourselves. */
+        if ((hold_lock = item_trylock(hv)) == NULL)
+            continue;
+        /* Now see if the item is refcount locked */
+        if (refcount_incr(search) != 2) {
+            /* Note pathological case with ref'ed items in tail.
+             * Can still unlink the item, but it won't be reusable yet */
+            itemstats[id].lrutail_reflocked++;
+            /* In case of refcount leaks, enable for quick workaround. */
+            /* WARNING: This can casuse terrible corruption */
+            if (settings.tail_repair_time &&
+                    search->time + settings.tail_repair_time < current_time) {
+                itemstats[id].tailrepairs++;
+                search->refcount = 1;
+                /* This will call item_remove -> item_free since refcnt is 1 */
+                STORAGE_delete(ext_storage, search);
+                do_item_unlink_nolock(search, hv);
+                item_trylock_unlock(hold_lock);
+                continue;
+            }
+        }
+
+        /* Expired or flushed */
+        if ((search->exptime != 0 && search->exptime < current_time) 
+                || item_is_flushed(search)) {
+            itemstats[id].reclaimed++;
+            if ((search->it_flags & ITEM_FETCHED) == 0) {
+                itemstats[id].expired_unfetched++;
+            }
+            /* refcnt 2 -> 1*/
+            do_item_unlink_nolock(search, hv);
+            STORAGE_delete(ext_storage, search);
+            /* refcnt 1 -> 0 -> item_free */
+            do_item_remove(search);
+            item_trylock_unlock(hold_lock);
+            removed++;
+
+            /* If all we're finding are expired, can keep going */
+            continue;
+        }
+
+        /* If we're HOT_LRU or WARM_LRU and over size limit, send to COLD_LRU.
+         * If we're COLD_LRU, send to WARM_LRU unless we need to evict.
+         */
+        switch (cur_lru) {
+            case HOT_LRU:
+                limit = total_bytes * settings.hot_lru_pct / 100;
+            case WARM_LRU:
+                if (limit == 0)
+                    limit = total_bytes * settings.warm_lru_pct / 100;
+                /* Rescue ACITVE items aggressively */
+                if ((search->it_flags & ITEM_ACTIVE) != 0) {
+                    search->it_flags &= ~ITEM_ACTIVE;
+                    removed++;
+                    if (cur_lru == WARM_LRU) {
+                        itemstats[id].moves_within_lru++;
+                        do_item_update_nolock(search);
+                        do_item_remove(search);
+                        item_trylock_unlock(hold_lock);
+                    } else {
+                        /* Active HOT_LRU items flow to WARM */
+                        itemstats[id].moves_to_warm++;
+                        move_to_lru = WARM_LRU;
+                        do_item_unlink_q(search);
+                        it = search;
+                    }
+                } else if (sizes_bytes[id] > limit ||
+                            current_time - search->time > max_age) {
+                    itemstats[id].moves_to_cold++;
+                    move_to_lru = COLD_LRU;
+                    do_item_unlink_q(search);
+                    it = search;
+                    removed++;
+                    break;
+                } else {
+                    /* Don't want to move to COLD, not active, bail out */
+                    it = search;
+                }
+                break;
+            case COLD_LRU:
+                it = search; /* No matter what, we're stopping */
         }
     }
 }
