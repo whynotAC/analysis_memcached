@@ -1160,6 +1160,641 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
                 break;
             case COLD_LRU:
                 it = search; /* No matter what, we're stopping */
+                if (flags & LRU_PULL_EVICT) {
+                    if (settings.evict_to_free == 0) {
+                        /* Don't think we need a counter for this. It'll OOM.*/
+                        break;
+                    }
+                    itemstats[id].evicted++;
+                    itemstats[id].evicted_time = current_time - search->time;
+                    if (search->exptime != 0)
+                        itemstats[id].evicted_nonzero++;
+                    if ((search->it_flags & ITEM_FETCHED) == 0) {
+                        itemstats[id].evicted_unfetched++;
+                    }
+                    if ((search->it_flags & ITEM_ACTIVE)) {
+                        itemstats[id].evicted_active++;
+                    }
+                    LOGGER_LOG(NULL, LOG_EVICTIONS, LOGGER_EVICTION, search);
+                    STORAGE_delete(ext_storage, search);
+                    do_item_unlink_nolock(search, hv);
+                    removed++;
+                    if (settings.slab_automove == 2) {
+                        slabs_reassign(-1, orig_id);
+                    }
+                } else if (flags & LRU_PULL_RETURN_ITEM) {
+                    /* Keep a reference to this item and return it. */
+                    ret_it->it = it;
+                    ret_it->hv = hv;
+                } else if ((search->it_flags & ITEM_ACTIVE) != 0
+                            && settings.lru_segmented) {
+                    itemstats[id].moves_to_warm++;
+                    search->it_flags &= ~ITEM_ACTIVE;
+                    move_to_lru = WARM_LRU;
+                    do_item_unlink_q(search);
+                    removed++;
+                }
+                break;
+            case TEMP_LRU:
+                it = search; /* Kill the loop. Parent only interested in recalims */
+                break;
+        }
+        if (it != NULL)
+            break;
+    }
+
+    pthread_mutex_unlock(&lru_locks[id]);
+
+    if (it != NULL) {
+        if (move_to_lru) {
+            it->slabs_clsid = ITEM_clsid(it);
+            it->slabs_clsid |= move_to_lru;
+            item_link_q(it);
+        }
+        if ((flags & LRU_PULL_RETURN_ITEM) == 0) {
+            do_item_remove(it);
+            item_trylock_unlock(hold_lock);
         }
     }
+
+    return removed;
+}
+
+/* TODO: Third place this code needs to be deduped */
+static void lru_bump_buf_link_q(lru_bump_buf *b) {
+    pthread_mutex_lock(&bump_buf_lock);
+    assert(b != bump_buf_head);
+
+    b->prev = 0;
+    b->next = bump_buf_head;
+    if (b->next) b->next->prev = b;
+    bump_buf_head = b;
+    if (bump_buf_tail == 0) bump_buf_tail = b;
+    pthread_mutex_unlock(&bump_buf_lock);
+    return;
+}
+
+void *item_lru_bump_buf_create(void) {
+    lru_bump_buf *b = calloc(1, sizeof(lru_bump_buf));
+    if (b == NULL) {
+        return NULL;
+    }
+
+    b->buf = bipbuf_new(sizeof(lru_bump_entry) * LRU_BUMP_BUF_SIZE);
+    if (b->buf == NULL) {
+        free(b);
+        return NULL;
+    }
+
+    pthread_mutex_init(&b->mutex, NULL);
+
+    lru_bump_buf_link_q(b);
+    return b;
+}
+
+static bool lru_bump_async(lru_bump_buf *b, item *it, uint32_t hv) {
+    bool ret = true;
+    refcount_incr(it);
+    pthread_mutex_lock(&b->mutex);
+    lru_bump_entry *be = (lru_bump_entry *) bipbuf_request(b->buf, sizeof(lru_bump_entry));
+    if (be != NULL) {
+        be->it = it;
+        be->hv = hv;
+        if (bipbuf_push(b->buf, sizeof(lru_bump_entry)) == 0) {
+            ret = false;
+            b->dropped++;
+        }
+    } else {
+        ret = false;
+        b->dropped++;
+    }
+
+    if (!ret) {
+        refcount_decr(it);
+    }
+    pthread_mutex_unlock(&b->mutex);
+    return ret;
+}
+
+/* TODO: Might be worth a micro-optimization of having bump buffers link 
+ * themselves back into the central queue when queue goes from zero to
+ * non-zero, then remove from list if zero more than N times.
+ * If very few hits on cold this would avoid extra memory barriers from LRU
+ * maintainer thread. If many hits, they'll just stay in the list. 
+ */
+static bool lru_maintainer_bumps(void) {
+    lru_bump_buf *b;
+    lru_bump_entry *be;
+    unsigned int size;
+    unsigned int todo;
+    bool bumped = false;
+    pthread_mutex_lock(&bump_buf_lock);
+    for (b = bump_buf_head; b != NULL; b=b->next) {
+        pthread_mutex_lock(&b->mutex);
+        be = (lru_bump_entry *) bipbuf_peek_all(b->buf, &size);
+        pthread_mutex_unlock(&b->mutex);
+
+        if (be == NULL) {
+            continue;
+        }
+        todo = size;
+        bumped = true;
+
+        while (todo) {
+            item_lock(be->hv);
+            do_item_update(be->it);
+            do_item_remove(be->it);
+            item_unlock(be->hv);
+            be++;
+            todo -= sizeof(lru_bump_entry);
+        }
+
+        pthread_mutex_lock(&b->mutex);
+        be = (lru_bump_entry *) bipbuf_poll(b->buf, size);
+        pthread_mutex_unlock(&b->mutex);
+    }
+    pthread_mutex_unlock(&bump_buf_lock);
+    return bumped;
+}
+
+static uint64_t lru_total_bumps_dropped(void) {
+    uint64_t total = 0;
+    lru_bump_buf *b;
+    pthread_mutex_lock(&bump_buf_lock);
+    for (b = bump_buf_head; b != NULL; b=b->next) {
+        pthread_mutex_lock(&b->mutex);
+        total += b->dropped;
+        pthread_mutex_unlock(&b->mutex);
+    }
+    pthread_mutex_unlock(&bump_buf_lock);
+    return total;
+}
+
+/* Loop up to N times:
+ * If too many items are in HOT_LRU, push to COLD_LRU
+ * If too many items are in WARM_LRU, push to COLD_LRU
+ * If too many items are in COLD_LRU, poke COLD_LRU tail
+ * 1000 loops with 1ms min sleep gives us under 1m items shifted/sec. The
+ * locks can't handle much more than that. Leaving a TODO for how to 
+ * autoadjust in the future.
+ */
+static int lru_maintainer_juggle(const int slabs_clsid) {
+    int i;
+    int did_moves = 0;
+    uint64_t total_bytes = 0;
+    unsigned int chunks_perslab = 0;
+    // unsigned int chunks_free = 0;
+    // TODO: if free_chunks below high watermark, increase aggressiveness
+    slabs_available_chunks(slabs_clsid, NULL,
+                    &total_bytes, &chunks_perslab);
+    if (settings.temp_lru) {
+        /* Only looking for reclaims. Run before we size the LRU. */
+        for (i = 0; i < 100; i++) {
+            if (lru_pull_tail(slabs_clsid, TEMP_LRU, 0, 0, 0, NULL) <= 0) {
+                break;
+            } else {
+                did_moves++;
+            }
+        }
+        total_bytes -= temp_lru_size(slabs_clsid);
+    }
+
+    rel_time_t cold_age = 0;
+    rel_time_t hot_age = 0;
+    rel_time_t warm_age = 0;
+    /* If LRU is in flat mode, force items to drain into COLD via max age */
+    if (settings.lru_segmented) {
+        pthread_mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
+        if (tails[slabs_clsid|COLD_LRU]) {
+            cold_age = current_time - tails[slabs_clsid|COLD_LRU]->time;
+        }
+        pthread_mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
+        hot_age = cold_age * settings.hot_max_factor;
+        warm_age = cold_age * settings.warm_max_factor;
+    }
+
+    /* Juggle HOT/WARM up to N times. */
+    for (i = 0; i < 500; i++) {
+        int do_more = 0;
+        if (lru_pull_tail(slabs_clsid, HOT_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, hot_age, NULL) ||
+                lru_pull_tail(slabs_clsid, WARM_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, warm_age, NULL)) {
+            do_more++;
+        }
+        if (settings.lru_segmented) {
+            do_more += lru_pull_tail(slabs_clsid, COLD_LRU, total_bytes, LRU_PULL_CRAWL_BLOCKS, 0, NULL);
+        }
+        if (do_more == 0)
+            break;
+        did_moves++;
+    }
+    return did_moves;
+}
+
+/* Will crawl all slab classes a minimum of once per hour */
+#define MAX_MAINTCRAWL_WAIT 60 * 60
+
+/* Hoping user input will improve this function. This is all a wild guess.
+ * Operation: Kicks crawler for each slab id. Crawlers take some statistics as
+ * to items with nonzero expirations. It then buckets how many items will
+ * expire per minute for the next hour.
+ * This function checks the results of a run, and if it things more than 1% of
+ * expirable objects are ready to go, kick the crawler again to reap.
+ * It will also kick the crawler once per minute regardless, waiting a minute
+ * longer for each time it has no work to do, up to an hour wait time.
+ * The latter is to avoid newly started daemons form waiting toto long before
+ * retrying a crawl.
+ */
+static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, logger *l) {
+    int i;
+    static rel_time_t next_crawls[POWER_LARGEST];
+    static rel_time_t next_crawl_wait[POWER_LARGEST];
+    uint8_t todo[POWER_LARGEST];
+    memset(todo, 0, sizeof(uint8_t) * POWER_LARGEST);
+    bool do_run = false;
+    unsigned int tocrawl_limit = 0;
+
+    // TODO: If not segmented LRU, skip non-clod
+    for (i = POWER_SMALLEST; i < POWER_LARGEST; i++) {
+        crawlerstats_t *s = &cdata->crawlerstats[i];
+        /* We've not successfully kicked off a crawl yet. */
+        if (s->run_complete) {
+            char *lru_name = "na";
+            pthread_mutex_lock(&cdata->lock);
+            int x;
+            /* Should we crawl again? */
+            uint64_t possible_reclaims = s->seen - s->noexp;
+            uint64_t available_reclaims = 0;
+            /* Need to think we can free at least !% of the items before
+             * crawling. */
+            /* FIXME: Configurable? */
+            uint64_t low_watermark = (possible_reclaims / 100) + 1;
+            rel_time_t since_run = current_time - s->end_time;
+            /* Don't bother if the payoff is too low */
+            for (x = 0; x < 60; x++) {
+                available_reclaims += s->histo[x];
+                if (available_reclaims > low_watermark) {
+                    if (next_crawl_wait[i] < (x * 60)) {
+                        next_crawl_wait[i] += 60;
+                    } else if (next_crawl_wait[i] >= 60) {
+                        next_crawl_wait[i] -= 60;
+                    }
+                    break;
+                }
+            }
+
+            if (available_reclaims == 0) {
+                next_crawl_wait[i] += 60;
+            }
+
+            if (next_crawl_wait[i] > MAX_MAINTCRAWL_WAIT) {
+                next_crawl_wait[i] = MAX_MAINTCRAWL_WAIT;
+            }
+
+            next_crawls[i] = current_time + next_crawl_wait[i] + 5;
+            switch (GET_LRU(i)) {
+                case HOT_LRU:
+                  lru_name = "hot";
+                  break;
+                case WARM_LRU:
+                  lru_name = "warm";
+                  break;
+                case COLD_LRU:
+                  lru_name = "cold";
+                  break;
+                case TEMP_LRU:
+                  lru_name = "temp";
+                  break;
+            }
+            LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_CRAWLER_STATUS, NULL,
+                        CLEAR_LRU(i),
+                        lru_name,
+                        (unsigned long long)low_watermark,
+                        (unsigned long long)available_reclaims,
+                        (unsigned int)since_run,
+                        next_crawls[i] - current_time,
+                        s->end_time - s->start_time,
+                        s->seen,
+                        s->reclaimed);
+            // Got our calculation, avoid running until next actual run.
+            s->run_complte = false;
+            pthread_mutex_unlock(&cdata->lock);
+        }
+        if (current_time > next_crawls[i]) {
+            pthread_mutex_lock(&lru_locks[i]);
+            if (sizes[i] > tocrawl_limit) {
+                tocrawl_limit = sizes[i];
+            }
+            pthread_mutex_unlock(&lru_locks[i]);
+            todo[i] = 1;
+            do_run = true;
+            next_crawls[i] = current_time + 5;  // minimum retry wait
+        }
+    }
+    if (do_run) {
+        if (settings.lru_crawler_tocrawl && settings.lru_crawler_tocrawl < tocrawl_limit) {
+            tocrawl_limit = settings.lru_crawler_tocrawl;
+        }
+        lru_crawler_start(todo, tocrawl_limit, CRAWLER_AUTOEXPIRE, cdata, NULL, 0);
+    }
+}
+
+slab_automove_reg_t slab_automove_default = {
+    .init = slab_automove_init,
+    .free = slab_automove_free,
+    .run = slab_automove_run
+};
+#ifdef EXTSTORE
+slab_automove_reg_t slab_automove_extstore = {
+    .init = slab_automove_extstore_init,
+    .free = slab_automove_extstore_free,
+    .run = slab_automove_extstore_run
+};
+#endif
+static pthread_t lru_maintainer_tid;
+
+#define MAX_LRU_MAINTAINER_SLEEP 1000000
+#define MIN_LRU_MAINTAINER_SLEEP 1000
+
+static void *lru_maintainer_thread(void *arg) {
+    slab_automove_reg_t *sam = &slab_automove_default;
+#ifdef EXTSTORE
+    void *storage = arg;
+    if (storage != NULL)
+        sam = &slab_automove_extstore;
+    int x;
+#endif
+    int i;
+    usesonds_t to_sleep = MIN_LRU_MAINTAINER_SLEEP;
+    useconds_t last_sleep = MIN_LRU_MAINTAINER_SLEEP;
+    rel_time_t last_crawler_check = 0;
+    rel_time_t last_automove_check = 0;
+    useconds_t next_juggles[MAX_NUMBER_OF_SLAB_CLASSES] = {0};
+    useconds_t backoff_juggles[MAX_NUMBER_OF_SLAB_CLASSES] = {0};
+    struct crawler_expired_data *cdata = 
+        calloc(1, sizeof(struct crawler_expired_data));
+    if (cdata == NULL) {
+        fprintf(stderr, "Failed to allocate crawler data for LRU maintainer thread\n");
+        abort();
+    }
+    pthread_mutex_init(&cdata->lock, NULL);
+    cdata->crawl_complete = true; // kick off the crawler.
+    logger *l = logger_create();
+    if (l == NULL) {
+        fprintf(stderr, "Failed to allocate logger for LRU maintainer thread\n");
+        abort();
+    }
+
+    double last_ratio = settings.slab_automove_ratio;
+    void *am = sam->init(&settings);
+
+    pthread_mutex_lock(&lru_maintainer_lock);
+    if (settings.verbose > 2)
+        fprintf(stderr, "Starting LRU maintainer background thread\n");
+    while (do_run_lru_maintainer_thread) {
+        pthread_mutex_unlock(&lru_maintainer_lock);
+        if (to_sleep)
+            usleep(to_sleep);
+        pthread_mutex_lock(&lru_maintainer_lock);
+        /* A sleep of zero counts as a minimum of a 1ms wait */
+        last_sleep = to_sleep > 1000 ? to_sleep : 1000;
+        to_sleep = MAX_LRU_MAINTAINER_SLEEP;
+
+        STATS_LOCK();
+        stats.lru_maintainer_juggles++;
+        STATS_UNLOCK();
+
+        /* Each slab class gets its own sleep to avoid hammering locks */
+        for (i = POWER_SMALLEST; i < MAX_NUMBER_OF_SLAB_CLASSES; i++) {
+            next_juggles[i] = next_juggles[i] > last_sleep ? next_juggles[i] - last_sleep : 0;
+
+            if (next_juggles[i] > 0) {
+                // Sleep the thread juse for the minimum amount (or not at all)
+                if (next_juggles[i] < to_sleep)
+                    to_sleep = next_juggles[i];
+                continue;
+            }
+
+            int did_moves = lru_maintainer_juggle(i);
+#ifdef EXTSTORE
+            // Deeper loop to speed up pushing to storage.
+            if (storage) {
+                for (x = 0; x < 500; x++) {
+                    int found;
+                    found = lru_maintainer_store(storage, i);
+                    if (found) {
+                        did_moves += found;
+                    } else {
+                        break;
+                    }
+                }
+            }
+#endif
+            if (did_moves == 0) {
+                if (backoff_juggles[i] != 0) {
+                    backoff_juggles[i] += backoff_juggles[i] / 8;
+                } else {
+                    backoff_juggles[i] = MIN_LRU_MAINTAINER_SLEEP;
+                }
+                if (backoff_juggles[i] > MAX_LRU_MAINTAINER_SLEEP)
+                    backoff_juggles[i] = MAX_LRU_MAINTAINER_SLEEP;
+            } else if (backoff_juggles[i] > 0) {
+                backoff_juggles[i] /= 2;
+                if (backoff_juggles[i] < MIN_LRU_MAINTAINER_SLEEP) {
+                    backoff_juggles[i] = 0;
+                }
+            }
+            next_juggles[i] = backoff_juggles[i];
+            if (next_juggles[i] < to_sleep)
+                to_sleep = next_juggles[i];
+        }
+
+        /* Minimize the sleep if we had async lRU bumps to process */
+        if (settings.lru_segmented && lru_maintainer_bumps() && to_sleep > 1000) {
+            to_sleep = 1000;
+        }
+
+        /* Once per second at most */
+        if (settings.lru_crawler && last_crawler_check != current_time) {
+            lru_maintainer_crawler_check(cdata, l);
+            last_crawler_check = current_time;
+        }
+
+        if (settings.slab_automove == 1 && last_automove_check != current_time) {
+            if (last_ratio != settings.slab_automove_ratio) {
+                sam->free(am);
+                am = sam->init(&settings);
+                last_ratio = settings.slab_automove_ratio;
+            }
+            int src, dst;
+            sam->run(am, &src, &dst);
+            if (src != -1 && dst != -1) {
+                slabs_reassign(src, dst);
+                LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL,
+                            src, dst);
+            }
+            // dst == 0 means reclaim to global pool, be more aggressive
+            if (dst != 0) {
+                last_automove_check = current_time;
+            } else if (dst == 0) {
+                // also ensure we minimize the thread sleep
+                to_sleep = 1000;
+            }
+        }
+    }
+    pthread_mutex_unlock(&lru_maintainer_lock);
+    sam->free(am);
+    // LRU crawler *must* be stopped
+    free(cdata);
+    if (settings.verbose > 2)
+        fprintf(stderr, "LRU maintainer thread stopping\n");
+
+    return NULL;
+}
+
+int stop_lru_maintainer_thread(void) {
+    int ret;
+    pthread_mutex_lock(&lru_maintainer_lock);
+    /* LRU thread is a sleep loop, will die on its own */
+    do_run_lru_maintainer_thread = 0;
+    pthread_mutex_unlock(&lru_maintainer_lock);
+    if ((ret = pthread_join(lru_maintainer_tid, NULL)) != 0) {
+        fprintf(stderr, "Failed to stop LRU maintainer thread: %s\n", strerror(ret));
+        return -1;
+    }
+    settings.lru_maintainer_thread = false;
+    return 0;
+}
+
+int start_lru_maintainer_thread(void *arg) {
+    int ret;
+
+    pthread_mutex_lock(&lru_maintainer_lock);
+    do_run_lru_maintainer_thread = 1;
+    settings.lru_maintainer_thread = true;
+    if ((ret = pthread_create(&lru_maintainer_tid, NULL,
+                    lru_maintainer_thread, arg)) != 0) {
+        fprintf(stderr, "Can't create LRU maintainer thread: %s\n",
+                strerror(ret));
+        pthread_mutex_unlock(&lru_maintainer_lock);
+        return -1;
+    }
+    pthread_mutex_unlock(&lru_maintainer_lock);
+
+    return 0;
+}
+
+/* If we hold this lock, crawler can't wake up or move */
+void lru_maintainer_pause(void) {
+    pthread_mutex_lock(&lru_maintainer_lock);
+}
+
+void lru_maintainer_resume(void) {
+    pthread_mutex_unlock(&lru_maintainer_lock);
+}
+
+int init_lru_maintainer(void) {
+    if (lru_maintainer_initialized == 0) {
+        pthread_mutex_init(&lru_maintainer_lock, NULL);
+        lru_maintainer_initialized = 1;
+    }
+    return 0;
+}
+
+/* Tail linkers and crawler for the LRU crawler */
+void do_item_linktail_q(item *it) { // item is the new tail
+    item **head, **tail;
+    assert(it->it_flags == 1);
+    assert(it->nbytes == 0);
+
+    head = &heads[it->slabs_clsid];
+    tail = &tails[it->slabs_clsid];
+    // assert(*tail != 0)
+    assert(it != *tail);
+    assert((*head && *tail) || (*head == 0 && *tail == 0));
+    it->prev = *tail;
+    it->next = 0;
+    if (it->prev) {
+        assert(it->prev->next == 0);
+        it->prev->next = it;
+    }
+    *tail = it;
+    if (*head == 0) *head = it;
+    return;
+}
+
+void do_item_unlinktail_q(item *it) {
+    item **head, **tail;
+    head = &heads[it->slabs_clsid];
+    tail = &tails[it->slabs_clsid];
+
+    if (*head == it) {
+        assert(it->prev == 0);
+        *head = it->next;
+    }
+    if (*tail == it) {
+        assert(it->next == 0);
+        *tail = it->prev;
+    }
+    assert(it->next != it);
+    assert(it->prev != it);
+
+    if (it->next) it->next->prev = it->prev;
+    if (it->prev) it->prev->next = it->next;
+    return;
+}
+
+/* This is too convoluted, but it's a difficult shuffle. Try to rewrite it
+ * more clearly */
+item *do_item_crawl_q(item *it) {
+    item **head, **tail;
+    assert(it->it_flags == 1);
+    assert(it->nbytes == 0);
+    head = &heads[it->slabs_clsid];
+    tail = &tails[it->slabs_clsid];
+
+    /* We've hit the head, pop off */
+    if (it->prev == 0) {
+        assert(*head == it);
+        if (it->next) {
+            *head = it->next;
+            assert(it->next->prev == it);
+            it->next->prev = 0;
+        }
+        return NULL;
+    }
+
+    /* Swing ourselves in front of the next item */
+    /* NB: If there is a prev, we can't be the head */
+    assert(it->prev != it);
+    if (it->prev) {
+        if (*head == it->prev) {
+            /* Prev was the head,  now we're the head */
+            *head = it;
+        }
+        if (*tail == it) {
+            /* We are the tail, now they are the tail */
+            *tail = it->prev;
+        }
+        assert(it->next != it);
+        if (it->next) {
+            assert(it->prev->next == it);
+            it->prev->next = it->next;
+            it->next->prev = it->prev;
+        } else {
+            /* Tail, Move this above? */
+            it->prev->next = 0;
+        }
+        /* prev->prev's next is it->prev */
+        it->next = it->prev;
+        it->prev = it->next->prev;
+        it->next->prev = it;
+        /* New it->prev now, if we're not at the head. */
+        if (it->prev) {
+            it->prev->next = it;
+        }
+    }
+    assert(it->next != it);
+    assert(it->prev != it);
+
+    return it->next; /* success */
 }
