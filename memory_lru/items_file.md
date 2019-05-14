@@ -105,6 +105,28 @@ items文件内容分析
 >		slab_automove_free_func free;
 >		slab_automove_run_func run;
 >	} slab_automove_reg_t;
+>
+>	// 下面两个结构体在crawler.h文件中
+>	typedef struct {
+>		uint64_t histo[61];
+>		uint64_t ttl_hourplus;
+>		uint64_t noexp;
+>		uint64_t reclaimed;
+>		uint64_t seen;
+>		rel_time_t start_time;
+>		rel_time_t end_time;
+>		bool run_complete;
+>	} crawlerstats_t;
+>
+>	struct crawler_expired_data {
+>		pthread_mutex_t lock;
+>		crawlerstats_t crawlerstats[POWER_LARGEST];
+>		/* redundant with crawlerstats_t so we can get overall start/stop/done*/
+>		rel_time_t start_time;
+>		rel_time_t end_time;
+>		bool crawl_complete;
+>		bool is_external; /* whather this was an alloc local or remote to the module*/
+>	};
 >```
 
 3 全局变量
