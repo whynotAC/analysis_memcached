@@ -126,7 +126,7 @@ items文件内容分析
 >		rel_time_t end_time;
 >		bool crawl_complete;
 >		bool is_external; /* whather this was an alloc local or remote to the module*/
->	};
+# >	};
 >```
 
 3 全局变量
