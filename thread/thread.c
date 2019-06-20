@@ -1,5 +1,30 @@
 
 
+/* An item in the connection queue */
+enum conn_queue_item_modes {
+    queue_new_conn,     // brand new connection
+    queue_redispatch,   // redispatching from side thread
+};
+typedef struct conn_queue_item CQ_ITEM;
+struct conn_queue_item {
+    int             sfd;
+    enum conn_stats init_state;
+    int             event_flags;
+    int             read_buffer_size;
+    enum network_transport      transport;
+    enum conn_queue_item_modes  mode;
+    conn *c;
+    CQ_ITEM         *next;
+};
+
+/* A connection queue */
+typedef struct conn_queue CQ;
+struct conn_queue {
+    CQ_ITEM *head;
+    CQ_ITEM *tail;
+    pthread_mutex_t lock;
+};
+
 /*
  * Each libevent instance has wakeup pipe, which other threads
  * can use to signal that they've put a new connection on its queue.
