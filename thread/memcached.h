@@ -1,4 +1,93 @@
 
+/**
+ * NOTE: if you modify this table you _MUST_ update the function state_text
+ */
+/**
+ * Possible states of a connection
+ */
+enum conn_states {
+    conn_listening,     /**< the socket which listens for connections */
+    conn_new_cmd,       /**< Prepare connection for next command */
+    conn_waiting,       /**< waiting for a readable socket */
+    conn_read,          /**< reading in a command line */
+    conn_parse_cmd,     /**< try to parse a command from the input buffer */
+    conn_write,         /**< writing out a simple response */
+    conn_nread,         /**< reading in a fixed number of bytes */
+    conn_swallow,       /**< swallowing unnecessary bytes w/o stroing */
+    conn_closing,       /**< closing this connection */
+    conn_mwrite,        /**< writing out many items sequentially */
+    conn_closed,        /**< connection is closed */
+    conn_watch,         /**< held by the logger thread as a watcher */
+    conn_max_state      /**< Max state value (used for assertion) */
+};
+
+enum network_transport {
+    local_transport,    /* Unix sockets */
+    tcp_transport,
+    udp_transport
+};
+
+/** Use X macros to avoid iterating over the stats fields during reset and 
+ * aggregation. No longer have to add new stats in 3+ place
+ */
+#define SLAB_STATS_FIELDS \
+    X(set_cmds) \
+    X(get_hits) \
+    X(touch_hits) \
+    X(delete_hits) \
+    X(cas_hits) \
+    X(cas_badval) \
+    X(incr_hits) \
+    X(decr_hits)
+
+/** Stats stored per slab (and per thread). */
+struct slab_stats {
+#define X(name) uint64_t    name;
+  SLAB_STATS_FIELDS
+#undef X
+};
+
+#define THREAD_STATS_FIELDS \
+    X(get_cmds) \
+    X(get_misses) \
+    X(get_expired) \
+    X(get_flushed) \
+    X(touch_cmds) \
+    X(touch_misses) \
+    X(delete_misses) \
+    X(incr_misses) \
+    X(decr_misses) \
+    X(cas_misses) \
+    X(bytes_written) \
+    X(flush_cmds) \
+    X(conn_yields) /* of yields for connections (-R option)*/ \
+    X(auth_cmds) \
+    X(auth_errors) \
+    X(idle_kicks) /* idle connection killed */
+
+#ifdef EXTSTORE
+#define EXTSTORE_THREAD_STATS_FIELDS \
+    X(get_extstore) \
+    X(recache_from_extstore) \
+    X(miss_from_extstore) \
+    X(badcrc_from_extstore)
+#endif
+
+/**
+ * Stats stored per-thread
+ */
+struct thread_stats {
+    pthread_mutex_t mutex;
+#define X(name) uint64_t name;
+    THREAD_STATS_FIELDS
+#ifdef EXTSTORE
+    EXTSTORE_THREAD_STATS_FIELDS
+#endif
+#undef X
+    struct slab_stats slab_stats[MAX_NUMBER_OF_SLAB_CLASSES];
+    uint64_t lru_hits[POWER_LARGEST]；
+};
+
 typedef struct {
     pthread_t thread_id;        // unique ID of this thread
     struct event_base *base;    // libevent handle this thread uses
@@ -15,3 +104,101 @@ typedef struct {
     logger *l;                  // logger buffer
     void *lru_bump_buf;         // async LRU bump buffer
 } LIBEVENT_THREAD;
+
+/**
+ * The structure respresenting a connection into memcached
+ */
+struct conn {
+    int sfd;
+    sasl_conn_t *sasl_conn;
+    bool authenticated;
+    enum conn_states state;
+    enum bin_substates substate;
+    rel_time_t last_cmd_time;
+    struct event event;
+    short ev_flags;
+    short which;    /** which events were just triggered */
+
+    char *rbuf;     /** buffer to read commands into */
+    char *rcurr;    /** but if we parsed some already, this is where we stopped */
+    int  rsize;     /** total allocated size of rbuf */
+    int  rbytes;    /** how much data, staring from rcur, do we have unparsed */
+
+    char *wbuf;
+    char *wcurr;
+    int  wsize;
+    int  wbytes;
+    /** which state to go into after finishing current write */
+    enum conn_states write_and_go;
+    void *write_and_free;    /** free this memory after finishing writing */
+
+    char *ritem; /** when we read in an item's value, it goes here */
+    int  rlbytes;
+
+    /* data for the nread state */
+
+    /**
+     * item is used to hold an item structure created after reading the command
+     * line of set/add/replace commands, but before we finished reading the
+     * actual data. The data is read into ITEM_data(item) to avoid extra
+     * copying.
+     */
+    void *item;     // for commands set/add/replace
+
+    /* data for the swallow state */
+    int  sbytes;    // how many bytes to swallow
+
+    /* data for the mwrite state */
+    struct iovec *iov;
+    int  iovsize;   // number of elements allocated in iov[]
+    int  iovused;   // number of elements used in iov[]
+
+    struct msghdr *msglist;
+    int  msgsize;   // number of elemments allocated in msglist[]
+    int  msgused;   // number of slements used in msglist[]
+    int  msgcurr;   // element in msglist[] being transmitted now
+    int  msgbytes;  // number of bytes in current msg
+
+    item **ilist;   // list of items to write out
+    int  isize;
+    item **icurr;
+    int  ileft;
+
+    char **suffixlist;
+    int  suffixsize;
+    char **suffixcurr;
+    int  suffixleft;
+#ifdef EXTSTORE
+    int  io_wrapleft;
+    unsigned int recache_counter;
+    io_wrap *io_wraplist;   /* linked list of io_wraps */
+    bool io_queued;         /* FIXME: debugging flag */
+#endif
+    enum protocol protocol; /* which protocol this connection speaks */
+    enum network_transport transport; /* what transport is used by this connection */
+
+    /* data for UDP clients */
+    int  request_id;    // Incomming UDP request ID, if this is a UDP "connection"
+    struct sockaddr_in6 request_addr;   // udp: Who sent the most recent request
+    socklen_t request_addr_size;
+    unsigned char *hdrbuf;  // udp pakcets headers
+    int  hdrsize;   // number of headers' worth of space is allocated
+
+    bool noreply;   // True if the reply should not be sent
+    /* current stats command */
+    struct {
+        char *buffer;
+        size_t size;
+        size_t offset;
+    } stats;
+
+    /* Binary protocol stuff */
+    /* This is where the binary header goes */
+    protocol_binary_request_header binary_header;
+    uint64_t cas; // the cas to return
+    short cmd;      // current command being processed
+    int opaque;
+    int keylen;
+    conn *next; // Used for generating a list of conn structures
+    LIBEVENT_THREAD *thread; // Pointer to the thread object serving this connection
+};
