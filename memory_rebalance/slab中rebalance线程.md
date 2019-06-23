@@ -82,10 +82,11 @@ slabRebalanceThread线程
 
 外界对`slab_reassign`的调用有以下几处:
 
-| 文件名	| 调用方式	| 备注		|
-|-----		|-------	|------	|
-| items.c	| `slabs_reassign(-1, orig_id);` | 轮询查找`slabclass`来充当`src_slabclass`|
-| memcached.c	 | `rv=slabs_reassign(src, dst)`| 通过外界命令调用`slab_rebalance`线程 |
+| 文件名	| 调用方式	| 函数  | 备注		|
+|-----		|-------	| ------ | ------	|
+| items.c	| `slabs_reassign(-1, orig_id);`| `lru_pull_tail` | 轮询查找`slabclass`来充当`src_slabclass`|
+| items.c | `slabs_reassign(src, dst)` | `lru_maintainer_thread` | 通过每个`slabclass`的状态来进行判断 |
+| memcached.c	 | `rv=slabs_reassign(src, dst)`| `process_command` | 通过外界命令调用`slab_rebalance`线程 |
 
 **3.2 `slabs_reassign `的代码结构**
 

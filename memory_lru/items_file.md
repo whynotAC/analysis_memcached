@@ -92,7 +92,7 @@ items文件内容分析
 >		pthread_mutex_t mutex;
 >		bipbuf_t *buf;
 >		uint64_t dropped;
->	} lru_bunp_buf;
+>	} lru_bump_buf;
 >
 >	typedef struct {
 >		item *it;
@@ -172,7 +172,7 @@ items文件内容分析
 | 变量名 | 定义 | 作用 | 备注 |
 | ------|-----|-----|-----|
 | `lru_locks` | `pthread_mutex_t lru_locks[POWER_LARGEST]` | `LRU`队列的锁数组 | 无 |
-| `lru_type_map` | `static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU}` | 所有`LRU`队列对应的值 | 无 |
+| `lru_type_map` | `static unsigned int lru_type_map[4] = {HOT_LRU, WARM_LRU, COLD_LRU, TEMP_LRU}` | 四种`LRU`队列对应的值 | 每个`slabclass`都拥有四个队列存放`item` |
 | `heads` | `static item *heads[LARGEST_ID]` | `LRU`队列的头数组 | 无 |
 | `tails` | `static item *tails[LARGEST_ID]` | `LRU`队列的尾数组 | 无 |
 | `itemstats` | `static itemstats_t itemstats[LARGEST_ID]` | `LRU`队列的信息 | 用于后续的`slab_rebalance`等处理操作 |
@@ -211,7 +211,7 @@ items文件内容分析
 | `lru_maintainer_bumps` | `static bool lru_maintainer_bumps(void)` | 未知 | 无 |
 | `lru_total_bumps_dropped` | `static uint64_t lru_total_bumps_dropped(void)` | 未知 | 无 |
 | `lru_maintainer_juggle` | `static int lru_maintainer_juggle(const int slabs_clsid)` | 此函数用于调整`slabs_clsid`对应的`LRU`链表的个数 | 无 |
-| `lru_maintainer_crawler_check` | `static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, logger *l)` |未知 | 无 |
+| `lru_maintainer_crawler_check` | `static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, logger *l)` |根据`cdata`中的内容，判断哪个`LRU`队列需要进行执行过期判断 | 此函数用于调用`item`过期判断的线程 |
 | `lru_maintainer_thread` | `static void *lru_maintainer_thread(void *arg)` | `lru maintainer`线程的函数 | 分析的主要对象 |
  
 
