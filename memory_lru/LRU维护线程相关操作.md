@@ -127,3 +127,7 @@ int stop_lru_maintainer_thread(void) {
 4. `TEMP lru`保存新的`item`处于非常短的TTL(2)。在`TEMP`队列中的`item`不会流转到其他`LRU`队列中。
 5. `HOT`队列和`WARM`队列会限制其内存使用比例，但是`COLD`队列和`TEMP`队列不会被限制。
 6. 根据`COLD`尾部`item`的过期时间，来限制`HOT`和`WARM`尾部`item`的过期时间。
+
+参考列表:
+
+[Replacing the cache replacement algorithm in memcached](https://memcached.org/blog/modern-lru/)
