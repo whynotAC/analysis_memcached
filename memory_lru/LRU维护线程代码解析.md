@@ -534,3 +534,4 @@ typedef struct {
 
 ### 流程图示
 
+![lru_pull_tail函数流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/gaitubao_lru_pull_tail函数流程.png)
