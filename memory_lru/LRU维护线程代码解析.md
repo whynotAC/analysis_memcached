@@ -535,3 +535,95 @@ typedef struct {
 ### 流程图示
 
 ![lru_pull_tail函数流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/gaitubao_lru_pull_tail函数流程.png)
+
+## `LRU`维护线程源代码中维护`worker`线程中`lru_bump_buf`结构的源代码
+
+在`LRU`维护线程中调用`lru_maintainer_bumps()`函数来实现维护`worker`线程中的`lru_bump_buf`结构。其源代码如下:
+
+```
+//lru_maintainer_thread函数中:
+//处理worker线程中的lru_bump_buf结构
+/* Minimize the sleep if we had async LRU bumps to process */
+if (settings.lru_segmented && lru_maintainer_bumps() && to_sleep > 1000) {
+	to_sleep = 1000;
+}
+
+//lru_maintainer_bumps函数
+//处理各个worker线程中的lru_bump_buf结构,此结构记录了worker线程最近被访问HOT/WARM队列的item。
+//当worker线程中的lru_bump_buf结构中item被释放时，会将最近访问的item移动到队列头部，保证被访问的item不会被换出。
+/* TODO: Might be worth a micro-optimization of having bump buffers link
+ * themselves back into the central queue when queue goes from zero to 
+ * non-zero, then remove from list if zero more than N times.
+ * If very few hits on cold this would avoid extra memory barriers from LRU
+ * maintainer thread. If many hits, they'll just stay in the list.
+ */
+static bool lru_maitainer_bumps(void) {
+	lru_bump_buf *b;
+	lru_bump_entry *be;
+	unsigned int size;
+	unsigned int todo;
+	bool bumped = false;
+	pthread_mutex_lock(&bump_buf_lock); // 对所有worker线程中lru_bump_buf组成的双向链表加锁
+	// 开始循环遍历每个worker线程的lru_bump_buf结构
+	for (b = bump_buf_head; b != NULL; b = b->next) {
+		pthread_mutex_lock(&b->mutex);
+		// 获取已经添加的item的数量，以及开始的位置
+		be = (lru_bump_entry *) bipbuf_peek_all(b->buf, &size);
+		pthread_mutex_unlock(&b->mutex);
+		
+		if (be == NULL) {
+			continue;
+		}
+		todo = size;
+		bumped = true;
+		
+		// 逐个释放item回到队列的头部
+		while (todo) {
+			item_lock(be->hv);
+			do_item_update(be->it); // 更新item队列位置
+			do_item_remove(be->it); // 删除引用
+			item_unlock(be->hv);
+			be++; // 下一个item
+			todo -= sizeof(lru_bump_entry);
+		}
+		
+		pthread_mutex_lock(&b->mutex);
+		// 将刚才释放的item所占lru_bump_buf的空间都是放掉
+		be = (lru_bump_entry *) bipbuf_poll(b->buf, size);
+		pthread_mutex_unlock(&b->mutex);
+	}
+	pthread_mutex_unlock(&bump_buf_lock);
+	return bumped;
+}
+
+```
+
+### 使用的结构体
+上述的函数中使用了大量的结构体，本小节将把上述的结构体逐一拆解，详细描述其功能以及调用关系。
+
+```
+typedef struct _lru_bump_buf {
+	// 构成双向链表的指针
+	struct _lru_bump_buf *prev;
+	strcut _lru_bump_buf *next;
+	pthread_mutex_t mutex;		// 使用此结构体的锁结构
+	bipbuf_t *buf;				// 真正存放数据的结构
+	uint64_t dropped;
+} lru_bump_buf;
+
+typedef struct {		// 此结构在bipbuffer.h文件中
+	unsigned long int size;
+	
+	/* region A */
+	unsigned int a_start, a_end;
+	
+	/* region B */
+	unsigned int b_end;
+	
+	/* is B insue? */
+	int b_inuse;
+	
+	unsigned char data[];
+} bipbuf_t;
+```
+
