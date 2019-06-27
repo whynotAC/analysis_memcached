@@ -534,7 +534,7 @@ typedef struct {
 
 ### 流程图示
 
-![lru_pull_tail函数流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/gaitubao_lru_pull_tail函数流程.png)
+![lru_pull_tail函数流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/lru_pull_tail函数流程.png)
 
 ## `LRU`维护线程源代码中维护`worker`线程中`lru_bump_buf`结构的源代码
 
@@ -625,5 +625,76 @@ typedef struct {		// 此结构在bipbuffer.h文件中
 	
 	unsigned char data[];
 } bipbuf_t;
+
+typedef struct { 	// 此结构用于保存worker线程访问的WARM队列中的item
+	item *it;
+	uint32_t hv;
+} lru_bump_entry;
+
+// lru_bump_buf链表使用的全局变量
+static lru_bump_buf *bump_buf_head = NULL; // 用于记录lru_bump_buf链表的队头
+static lru_bump_buf *bump_buf_tail = NULL; // 用于记录lru_bump_buf链表的队尾
+static pthread_mutex_t bump_buf_lock = PTHREAD_MUTEX_INITAILIZER; // 用于控制lru_bump_buf链表的访问互斥
+
+#define LRU_BUMP_BUF_SIZE 8192 // worker线程中lru_bump_buf结构中buf存储lru_bump_entry的个数
 ```
+
+### 创建`lru_bump_buf`链表
+上面讲述了`lru_bump_buf`链表的结构体，每个`worker`线程中都有存储此结构体的指针。下面介绍`lru_bump_buf`链表的创建过程，以及如何跟`worker`线程关联起来。
+
+在`worker`线程创建过程中，将会调用`worker_libevent`函数，此函数中将调用`item_lru_bump_buf_create`函数来完成`worker`线程中的`lru_bump_buf`空间申请，以及`lru_bump_buf`链表的创建。
+
+```
+// thread.c文件中worker线程创建过程中worker_libevent函数:
+static void *worker_libevent(void *arg) {
+	LIBEVENT_THREAD *me = arg;
+	
+	···
+	me->lru_bump_buf = item_lru_bump_buf_create(); // 此函数用于创建`lru_bump_buf`链表
+	···
+}
+
+// items.c文件中item_lru_bump_buf_create函数:
+void *item_lru_bump_buf_create(void) {
+	lru_bump_buf *b = calloc(1, sizeof(lru_bump_buf)); // 创建一个lru_bump_buf结构
+	if (b == NULL) {
+		return NULL;
+	}
+	
+	b->buf = bipbuf_new(sizeof(lru_bump_entry) * LRU_BUMP_BUF_SIZE); // lru_bump_buf结构体中buf申请LRU_BUMP_BUF_SIZE个lru_bump_entry结构体
+	if (b->buf == NULL) {
+		free(b);
+		return NULL;
+	}
+	
+	pthread_mutex_init(&b->mutex, NULL); // 初始化lru_bump_buf结构体的互斥量
+	
+	lru_bump_buf_link_q(b); // 将worker线程中的lru_bump_buf结构链接成双向链表
+	return b;
+}
+
+// 将worker线程中的lru_bump_buf链接成双向链表
+static void lru_bump_buf_link_q(lru_bump_buf *b) {
+	pthread_mutex_lock(&bump_buf_lock); // 获取链表的互斥量
+	assert(b != bump_buf_head);
+	
+	// 构建双向链表 --- 头插法
+	b->prev = 0;
+	b->next = bump_buf_head;
+	if (b->next) b->next->prev = b;
+	bump_buf_head = b;
+	if (bump_buf_tail == 0) bump_buf_tail = b;
+	pthread_mutex_unlock(&bump_buf_lock);
+	return;
+}
+```
+整个`lru_bump_buf`链表的结构图示如下所示:
+
+![lru_bump_buf链表的图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/lru_bump_buf链表.png)
+
+
+
+
+
+
 
