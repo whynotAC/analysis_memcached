@@ -692,6 +692,33 @@ static void lru_bump_buf_link_q(lru_bump_buf *b) {
 
 ![lru_bump_buf链表的图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/lru_bump_buf链表.png)
 
+## `LRU`维护线程源代码中调用`LRU`扫描线程的源代码
+上面两个小节分别解读了`LRU`维护线程中关于维护`LRU`队列长度、`worker`线程组成的`lru_bump_buf`双向链表结构。本小节将着重介绍一下`LRU`维护线程中关于调用`LRU`扫描线程的代码部分。其源代码如下:
+
+```
+// items.c文件中lru_maintainer_thread函数，调用LRU扫描线程的代码
+if (settings.lru_crawler && last_crawler_check != current_time) { // 判断是否可以调用LRU扫描线程
+	lru_maintainer_crawler_check(cdata, l); // 调用LRU扫描线程代码
+	last_crawler_check = current_time;
+}
+
+// item.c文件中lru_maintainer_crawler_check函数
+/* Will crawl all slab classes a minimum of once per hour */
+#define MAX_MAINTCRAWL_WAIT 60 * 60
+
+/* Hoping user input will improve this function. This is all a wild guess.
+ * Operation: Kicks crawler for each slab id. Crawlers take some statistics as
+ * to items with nonzero expirations. It then buckets how many items will
+ * expire per minute for the next hour.
+ * This function checks the results of a run, and if it things more than 1% of
+ * expirable objects are ready to go, kick the crawler again to reap.
+ * It will also kick the crawler once per minute regardless, waiting a minute
+ * longer for each time it has no work to do, up to an hour wait time.
+ * The latter is to avoid newly started daemons from waiting too long before
+ * retrying a crawl.
+ */
+ 
+```
 
 
 
