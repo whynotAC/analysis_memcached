@@ -717,7 +717,197 @@ if (settings.lru_crawler && last_crawler_check != current_time) { // 判断是�
  * The latter is to avoid newly started daemons from waiting too long before
  * retrying a crawl.
  */
+ static void lru_maitainer_crawler_check(struct crawler_expired_data *cdata, logger *l) {
+ 	int i;
+ 	static rel_time_t next_crawls[POWER_LARGEST]; //下次调整的时间
+ 	static rel_time_t next_crawl_wait[POWER_LARGEST]; //下次调整的时间记录
+ 	uint8_t todo[POWER_LARGEST]; // 记录LRU是否需要进行LRU扫描
+ 	memset(todo, 0, sizeof(uint8_t) * POWER_LARGEST);
+ 	bool do_run = false;
+ 	unsigned int tocrawl_limit = 0;
+ 	
+ 	// TODO: If not segmented LRU, skip non-cold
+ 	for (i = POWER_SMALLEST; i < POWER_LARGEST; i++) {
+ 		crawlerstats_t *s = &cdata->crawlerstats[i];
+ 		// We've not successfully kicked off a crawl yet.
+ 		if (s->run_complete) {
+ 			char *lru_name = "na";
+ 			pthread_mutex_lock(&cdata->lock);
+ 			int x;
+ 			// Should we crawl again?
+ 			uint64_t possible_reclaims = s->seen - s->noexp;
+ 			uint64_t available_reclaims = 0;
+ 			// Need to think we can free at least 1% of the items before
+ 			// crawling.
+ 			// FIXME: Configurable?
+ 			uint64_t low_watermark = (possible_reclaims / 100) + 1;
+ 			rel_time_t since_run = current_time - s->end_time;
+ 			// Don't bother if the payoff is too low.
+ 			for (x = 0; x < 60; x++) {
+ 				available_reclaims += s->histo[x];
+ 				if (available_reclaims > low_watermark) {
+ 					if (next_crawl_wait[i] < (x * 60)) {
+ 						next_crawl_wait[i] += 60;
+ 					} else if (next_crawl_wait[i] >= 60) {
+ 						next_crawl_wait[i] -= 60;
+ 					}
+ 					break;
+ 				}
+ 			}
+ 			
+ 			if (available_reclaims == 0) {
+ 				next_crawl_wait[i] += 60;
+ 			}
+ 			
+ 			if (next_crawl_wait[i] > MAX_MAINTCRAWL_WAIT) {
+ 				next_crawl_wait[i] = MAX_MAINTCRAWL_WAIT;
+ 			}
+ 			
+ 			next_crawls[i] = current_time + next_crawl_wait[i] + 5;
+ 			switch (GET_LRU(i)) {
+ 				case HOT_LRU:
+ 					lru_name = "hot";
+ 					break;
+ 				case WARM_LRU:
+ 					lru_name = "warm";
+ 					break;
+ 				case COLD_LRU:
+ 					lru_name = "cold";
+ 					break;
+ 				case TEMP_LRU:
+ 					lru_name = "temp";
+ 					break;
+ 			}
+ 			LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_CRAWLER_STATUS, NULL,
+ 						CLEAR_LRU(i),
+ 						lru_name,
+ 						(unsigned long long)low_watermark,
+ 						(unsigned long long)available_reclaims,
+ 						(unsigned int)since_run,
+ 						next_crawls[i] - current_time,
+ 						s->end_time - s->start_time,
+ 						s->seen,
+ 						s->reclaimed);
+ 		}
+ 		if (current_time > next_crawls[i]) {
+ 			pthread_mutex_lock(&lru_locks[i]);
+ 			if (sizes[i] > tocrawl_limit) {
+ 				tocrawl_limit = sizes[i];
+ 			}
+ 			pthread_mutex_unlock(&lru_locks[i]);
+ 			todo[i] = 1;
+ 			do_run = true;
+ 			next_crawls[i] = current_time + 5; // minimum retry wait.
+ 		}
+ 	}
+ 	if (do_run) {
+ 		if (settings.lru_crawler_tocrawl && settings.lru_crawler_tocrawl < tocrawl_limit) {
+ 			tocrawl_limit = settings.lru_crawler_tocrawl;
+ 		}
+ 		lru_crawler_start(todo, tocrawl_limit, CRAWLER_AUTOEXPIRE, cdata, NULL, 0);
+ 	}
+ }
  
+// crawler.c文件中通知LRU扫描线程工作的lru_crawler_start函数
+int lru_crawler_start(uint8_t *ids, uint32_t remaining, const enum crawler_run_type type, void *data, void *c, const int sfd) {
+	int starts = 0;
+	bool is_running;
+	static rel_time_t block_ae_until = 0;
+	pthread_mutex_lock(&lru_crawler_lock);
+	STATS_LOCK();
+	is_running = stats_state.lru_crawler_running;
+	STATS_UNLOCK();
+	if (is_running &&
+			!(type == CRAWLER_AUTOEXPIRE && active_crawler_type == CRAWLER_AUTOEXPIRE) {
+		pthread_mutex_unlock(&lru_crawler_lock);
+		block_ae_until = current_time + 60;
+		return -1;
+	}
+	
+	if (type == CRAWLER_AUTOEXPIRE && block_ae_until > current_time) {
+		pthread_mutex_unlock(&lru_crawler_lock);
+		return -1;
+	}
+	
+	/* Configure the module */
+	if (!is_running) {
+		assert(crawler_mod_regs[type] != NULL);
+		active_crawler_mod.mod = crawler_mod_regs[type];
+		active_crawler_type = type;
+		if (active_crawler_mod.mod->init = NULL) {
+			active_crawler_mod.mod->init(&active_crawler_mod, data);
+		}
+		if (active_crawler_mod.mod->needs_client) {
+			if (c == NULL || sfd == 0) {
+				pthread_mutex_unlock(&lru_crawler_lock);
+				return -2;
+			}
+			if (lru_crawler_set_client(&active_crawler_mod, c, sfd) != 0) {
+				pthread_mutex_unlock(&lru_crawler_lock);
+				return -2;
+			}
+		}
+	}
+	
+	/* we allow the qutocrawler to restart sub-LRU's before completion */
+	for (int sid = POWER_SMALLEST; sid < POWER_LARGEST; sid++) {
+		if (ids[sid])
+			starts += do_lru_crawler_start(sid, remaining);
+	}
+	if (starts) {
+		pthread_cond_signal(&lru_crawler_cond);
+	}
+	pthread_mutex_unlock(&lru_crawler_lock);
+	return starts;
+}
+
+// crawler.c文件中通知LRU扫描线程工作的do_lru_crawler_start函数
+/* 'remaining' is passed in so the LRU maintainer thread can scrub the whole
+ * LRU every time.
+ */
+static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
+	uint32_t sid = id;
+	int starts = 0;
+	
+	pthread_mutex_lock(&lru_locks[sid]);
+	if (crawlers[sid].it_flags == 0) {
+		if (settings.verbose > 2)
+			fprintf(stderr, "Kicking LRU crawler off for LRU %u\n", sid);
+		crawlers[sid].nbytes = 0;
+		crawlers[sid].nkey = 0;
+		crawlers[sid].it_flags = 1; // For a crawler, this means enabled.
+		crawlers[sid].next = 0;
+		crawlers[sid].prev = 0;
+		crawlers[sid].time = 0;
+		if (remaining == LRU_CRAWLER_CAP_REMAINING) {
+			remaining = do_get_lru_size(sid);
+		}
+		/* Values for remaining:
+		 * remaining = 0
+		 * - scan all elements, until a NULL is reached
+		 * - if empty, NULL is reached right away
+		 * remaining = n + 1
+		 * - first n elements are parsed (or until a NULL is reached)
+		 */
+		 if (remaining) remaining++;
+		 crawlers[sid].remaining = remaining;
+		 crawlers[sid].slabs_clsid = sid;
+		 crawlers[sid].reclaimed = 0;
+		 crawlers[sid].unfetched = 0;
+		 crawlers[sid].checked = 0;
+		 do_item_linktail_q((item *)&crawlers[sid]);
+		 crawler_count++;
+		 starts++;
+	}
+	pthread_mutex_unlock(&lru_locks[sid]);
+	if (starts) {
+		STATS_LOCK();
+		stats_state.lru_crawler_running = true;
+		stats.lru_crawler_starts++;
+		STATS_UNLOCK();
+	}
+	return starts;
+}
 ```
 
 
