@@ -720,29 +720,32 @@ if (settings.lru_crawler && last_crawler_check != current_time) { // 判断是�
  static void lru_maitainer_crawler_check(struct crawler_expired_data *cdata, logger *l) {
  	int i;
  	static rel_time_t next_crawls[POWER_LARGEST]; //下次调整的时间
- 	static rel_time_t next_crawl_wait[POWER_LARGEST]; //下次调整的时间记录
+ 	static rel_time_t next_crawl_wait[POWER_LARGEST]; //下次调整的等待时间
  	uint8_t todo[POWER_LARGEST]; // 记录LRU是否需要进行LRU扫描
  	memset(todo, 0, sizeof(uint8_t) * POWER_LARGEST);
  	bool do_run = false;
- 	unsigned int tocrawl_limit = 0;
+ 	unsigned int tocrawl_limit = 0; // 每个LRU链表中item的字节数
  	
  	// TODO: If not segmented LRU, skip non-cold
+ 	// 依次判断每个LRU是否需要进行LRU过期扫描
  	for (i = POWER_SMALLEST; i < POWER_LARGEST; i++) {
- 		crawlerstats_t *s = &cdata->crawlerstats[i];
+ 		crawlerstats_t *s = &cdata->crawlerstats[i]; // 每个LRU的状态信息记录
  		// We've not successfully kicked off a crawl yet.
- 		if (s->run_complete) {
+ 		if (s->run_complete) {				// 判断LRU链表是否完成过期扫描
  			char *lru_name = "na";
  			pthread_mutex_lock(&cdata->lock);
  			int x;
  			// Should we crawl again?
- 			uint64_t possible_reclaims = s->seen - s->noexp;
+ 			uint64_t possible_reclaims = s->seen - s->noexp; // 可能存在的过期item数量
  			uint64_t available_reclaims = 0;
  			// Need to think we can free at least 1% of the items before
  			// crawling.
  			// FIXME: Configurable?
- 			uint64_t low_watermark = (possible_reclaims / 100) + 1;
- 			rel_time_t since_run = current_time - s->end_time;
+ 			uint64_t low_watermark = (possible_reclaims / 100) + 1; // 最低水平线
+ 			rel_time_t since_run = current_time - s->end_time; // 距离上次LRU检查的时间
  			// Don't bother if the payoff is too low.
+ 			// crawlerstats_t结构体中存在histo数组，此数组用来保存此LRU链表中下一个hour中每分钟过期的item数量。
+ 			// 根据下一个hour中每分钟过期的item数量，来判断什么时候开始扫描LRU队列。
  			for (x = 0; x < 60; x++) {
  				available_reclaims += s->histo[x];
  				if (available_reclaims > low_watermark) {
@@ -760,10 +763,13 @@ if (settings.lru_crawler && last_crawler_check != current_time) { // 判断是�
  			}
  			
  			if (next_crawl_wait[i] > MAX_MAINTCRAWL_WAIT) {
+ 				// 最长等待时间为1hour
  				next_crawl_wait[i] = MAX_MAINTCRAWL_WAIT;
  			}
- 			
+ 			// next_crawl_wait是距离下次LRU扫描的时间
+ 			// next_crawls用于保存下次LRU扫描的时间
  			next_crawls[i] = current_time + next_crawl_wait[i] + 5;
+ 			// 用于记录LRU的扫描信息
  			switch (GET_LRU(i)) {
  				case HOT_LRU:
  					lru_name = "hot";
@@ -789,6 +795,7 @@ if (settings.lru_crawler && last_crawler_check != current_time) { // 判断是�
  						s->seen,
  						s->reclaimed);
  		}
+ 		// 判断LRU链表是否要进行LRU过期扫描
  		if (current_time > next_crawls[i]) {
  			pthread_mutex_lock(&lru_locks[i]);
  			if (sizes[i] > tocrawl_limit) {
@@ -804,6 +811,7 @@ if (settings.lru_crawler && last_crawler_check != current_time) { // 判断是�
  		if (settings.lru_crawler_tocrawl && settings.lru_crawler_tocrawl < tocrawl_limit) {
  			tocrawl_limit = settings.lru_crawler_tocrawl;
  		}
+ 		// 开启LRU过期扫描线程
  		lru_crawler_start(todo, tocrawl_limit, CRAWLER_AUTOEXPIRE, cdata, NULL, 0);
  	}
  }
@@ -812,31 +820,35 @@ if (settings.lru_crawler && last_crawler_check != current_time) { // 判断是�
 int lru_crawler_start(uint8_t *ids, uint32_t remaining, const enum crawler_run_type type, void *data, void *c, const int sfd) {
 	int starts = 0;
 	bool is_running;
-	static rel_time_t block_ae_until = 0;
+	static rel_time_t block_ae_until = 0; // 每隔60s检查LRU过期扫描是否完成
 	pthread_mutex_lock(&lru_crawler_lock);
 	STATS_LOCK();
 	is_running = stats_state.lru_crawler_running;
 	STATS_UNLOCK();
+	// 当LRU扫描线程正在进行中，并且又有过期扫描任务进入。则等待60s后再进行判断。
 	if (is_running &&
 			!(type == CRAWLER_AUTOEXPIRE && active_crawler_type == CRAWLER_AUTOEXPIRE) {
 		pthread_mutex_unlock(&lru_crawler_lock);
 		block_ae_until = current_time + 60;
 		return -1;
 	}
-	
+	// 判断LRU过期扫描是否需要进行
 	if (type == CRAWLER_AUTOEXPIRE && block_ae_until > current_time) {
 		pthread_mutex_unlock(&lru_crawler_lock);
 		return -1;
 	}
 	
 	/* Configure the module */
+	// 如果LRU线程还没有开始运行则初始化LRU过期扫描线程所需的配置
 	if (!is_running) {
 		assert(crawler_mod_regs[type] != NULL);
+		// 判断LRU过期扫描线程所使用的方法
 		active_crawler_mod.mod = crawler_mod_regs[type];
 		active_crawler_type = type;
 		if (active_crawler_mod.mod->init = NULL) {
 			active_crawler_mod.mod->init(&active_crawler_mod, data);
 		}
+		// 判断是否需要客户端
 		if (active_crawler_mod.mod->needs_client) {
 			if (c == NULL || sfd == 0) {
 				pthread_mutex_unlock(&lru_crawler_lock);
@@ -850,10 +862,12 @@ int lru_crawler_start(uint8_t *ids, uint32_t remaining, const enum crawler_run_t
 	}
 	
 	/* we allow the qutocrawler to restart sub-LRU's before completion */
+	// 判断哪个LRU队列是否需要进行LRU过期扫描
 	for (int sid = POWER_SMALLEST; sid < POWER_LARGEST; sid++) {
 		if (ids[sid])
-			starts += do_lru_crawler_start(sid, remaining);
+			starts += do_lru_crawler_start(sid, remaining); // 向LRU队列添加扫描伪item
 	}
+	// 向LRU扫描线程释放信号
 	if (starts) {
 		pthread_cond_signal(&lru_crawler_cond);
 	}
@@ -870,9 +884,12 @@ static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
 	int starts = 0;
 	
 	pthread_mutex_lock(&lru_locks[sid]);
-	if (crawlers[sid].it_flags == 0) {
+	// crawlers数组中每个LRU队列对应一个数组下标
+	if (crawlers[sid].it_flags == 0) {	// 判断LRU队列对应的item是否正在使用
 		if (settings.verbose > 2)
 			fprintf(stderr, "Kicking LRU crawler off for LRU %u\n", sid);
+		// 设置crawlers中sid对应的item值，并将其加入到LRU队列中，从后往前依次扫描
+		// 伪item的标识为it_flags为1，并且item其它的值为0
 		crawlers[sid].nbytes = 0;
 		crawlers[sid].nkey = 0;
 		crawlers[sid].it_flags = 1; // For a crawler, this means enabled.
@@ -890,13 +907,13 @@ static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
 		 * - first n elements are parsed (or until a NULL is reached)
 		 */
 		 if (remaining) remaining++;
-		 crawlers[sid].remaining = remaining;
+		 crawlers[sid].remaining = remaining; // LRU队列保存的字节数
 		 crawlers[sid].slabs_clsid = sid;
 		 crawlers[sid].reclaimed = 0;
 		 crawlers[sid].unfetched = 0;
 		 crawlers[sid].checked = 0;
-		 do_item_linktail_q((item *)&crawlers[sid]);
-		 crawler_count++;
+		 do_item_linktail_q((item *)&crawlers[sid]); // 将伪item加入到LRU链表中
+		 crawler_count++;	// 全局变量，用于判断扫描LRU链表的个数
 		 starts++;
 	}
 	pthread_mutex_unlock(&lru_locks[sid]);
@@ -910,6 +927,117 @@ static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
 }
 ```
 
+上面的代码中显示了`LRU`维护线程中关于`LRU`过期扫描线程的调用链:
+
+`lru_maintainer_thread`函数--->`lru_maintainer_crawler_check`函数--->`lru_crawler_start`函数--->`do_lru_crawler_start`函数
+
+## 使用的结构体
+通过代码可以看出此调用链中存在大量的结构体和全局变量，这些结构体/变量在函数中起了很重要的作用。我们将对这些信息进行逐一解释和分析。
+
+```
+// 重要的全局变量
+#define LRU_CRAWLER_CAP_REMAINING -1
+
+// 每一个LRU链表都拥有一个crawlerstats_t结构体
+typedef struct {
+	uint64_t histo[61];		// 在未来1hour中每分钟过期的item数量
+	uint64_t ttl_hourplus;
+	uint64_t noexp;
+	uint64_t reclaimed;
+	uint64_t seen;
+	rel_time_t start_time;	// LRU链表的扫描开始时间
+	rel_time_t end_time; // LRU链表的扫描结束时间
+	bool run_complete;	// 此LRU链表是否完成
+} crawlerstats_t;
+
+// LRU扫描线程使用的重要结构
+struct crawler_expired_data {
+	pthread_mutex_t lock;	// 结构锁
+	crawlerstats_t crawlerstats[POWER_LARGEST]; // 每个LRU链表的信息
+	/* redundant with crawlerstats_t so we can get overall start/stop/done */
+	rel_time_t start_time;	// LRU扫描线程的开始时间
+	rel_time_t end_time;	// LRU扫描线程的结束时间
+	bool crawl_complete;	// LRU扫描线程是否完成
+	// 判断本结构体是由LRU线程申请还是其他线程申请的。
+	bool is_external; /* whether this was an alloc local or remote to the module */
+};
+
+// LRU过期扫描线程的工作方法,本小节使用的工作方法为CRAWLER_AUTOEXPIRE
+enum crawler_run_type {
+	CRAWLER_AUTOEXPIRE=0, CRAWLER_EXPIRED, CRAWLER_METADUMP
+};
+
+// LRU扫描线程使用的结构体，以及相关函数
+// 用于控制crawler线程使用的client结构体
+typedef struct {
+	// 用于crawler_client链接的connect结构体
+	void *c; // original connection structure. still with source thread attached.
+	int sfd; // client fd; connect链接后返回的文件描述符
+	bipbuf_t *buf;	// output buffer,客户端对应的bipbuf_t结构，跟worker线程中的一样
+	char *cbuf;	// current buffer,client对应的缓冲区
+} crawler_client_t;
+
+typedef struct _crawler_module_t crawler_module_t;
+
+typedef void (*crawler_eval_func)(crawler_module_t *cm, item *it, uint32_t hv, int slab_cls); // 用于判断item在crawler线程过期检查中是否要移除的判断函数指针
+typedef int (*crawler_init_func)(crawler_module_t *cm, void *data); // 用于初始化crawler线程使用的crawler_expired_datae结构体
+typedef void (*crawler_deinit_func)(crawler_module_t *cm); // TODO: extra args?
+typedef void (*crawler_doneclass_func)(crawler_module_t *cm, int slab_cls); // 当crawler线程扫描完某个LRU时调用
+typedef void (*crawler_finalize_func)(crawler_module_t *cm); // 整个crawler扫描结束时调用
+
+// 用于存放crawler线程扫描过程中使用函数的结构体--不同的工作方法对应不同的函数
+typedef struct {
+	crawler_init_func init;		// run before crawl starts
+	crawler_eval_func eval;		// runs on an item
+	crawler_doneclass_func doneclass;	// runs once per sub-crawler completion
+	crawler_finalize_func finalize;	// runs once when all sub-crawlers are done.
+	bool needs_lock;	// whether or not we need the LRU lock held when eval is called
+	bool needs_client;	// whether or not to grab onto the remote client
+} crawler_module_reg_t;
+
+// crawler线程扫描过程中所使用的所有方法以及数据的存储结构
+struct _crawler_module_t {
+	void *data;						// 数据
+	crawler_client_t c;				// 客户端
+	crawler_module_reg_t *mod;		// 方法
+};
+
+// crawler线程扫描过程中使用的伪item的结构
+typedef struct {
+	struct _stritem *next;		// 双向链表的链接指针
+	struct _stritem *prev;
+	struct _stritem *h_next;	// hash chain next
+	rel_time_t	time;			// least recent access
+	rel_time_t	exptime;		// expire time
+	int				nbytes;		// size of data
+	unsigned short refcount;
+	uint8_t		nsuffix;		// length of flags-and-length string
+	uint8_t		it_flags;		// ITEM_* above
+	uitn8_t		slabs_clsid;	// which salb class we're in
+	uint8_t		nkey;			// key length, w/terminating null and padding
+	uint8_t		remaining;	// Max keys to crawl per slab invocation
+	uint8_t		unfetched;	// items reclaimed unfetched during this crawl
+	uint8_t		checked;		// items examined during this crawl
+} crawler;
+
+// 上面介绍完了所有需要使用的结构体以及函数指针，下面将介绍全局变量
+// crawler扫描线程CRAWLER_AUTOEXPIRE/CRAWLER_EXPIRED工作方式下的工作函数
+crawler_module_reg_t crawler_expired_mod = {
+	.init = crawler_expired_init,		// 初始化函数
+	.eval = crawler_expired_eval,		// 判断函数
+	.doneclass = crawler_expired_doneclass, // 完成一个LRU链表检测时调用
+	.finalize = crawler_expired_finalize,  // crawler终结时调用
+	.needs_lock = true,
+	.needs_client = false
+};
+
+crawler_module_reg_t *crawler_metadump_mod = {
+	.init = NULL,
+	.eval = crawler_metadump_eval,
+	.doneclass = NULL,
+	.finalize = crawler_metadump_
+};
+```
 
 
 
