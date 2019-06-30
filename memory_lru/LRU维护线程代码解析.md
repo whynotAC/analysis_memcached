@@ -1067,8 +1067,332 @@ static ptherad_cond_t  lru_crawler_cond = PTHREAD_COND_INITIALIZER; // 条件变
 
 ![伪ITEM插入LRU链表的图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/crawler扫描线程的伪ITEM.png)
 
+## `LRU`维护线程源代码中调用`slab_rebalance_thread`线程的源代码
+本小节将介绍`LRU`维护线程是如何判断需要`slab_rebalance`移动，以及判断哪个`slab`需要移出移入操作。其源代码如下:
 
+```
+// items.c文件中lru_maintainer_thread函数中带调用`slab_rebalance`函数的方法
+static void *lru_maintainer_thread(void *arg) {
+	slab_automove_reg_t *sam = &slab_automove_default;
+#ifdef EXTSTORE
+	void *storage = arg;
+	if (storage != NULL)
+		sam = &slab_automove_extstore;
+	int x;
+#endif
+	···
+	rel_time_t last_automove_check = 0; // 最后调用slab_rebalance的时间
+	···
+	double last_ratio = settings.slab_automove_ratio; // 年轻slab与老slab的比例
+	void *am = sam->init(&settings);		// 调用初始化函数
+	···
+	
+	while (do_run_lru_maintainer_thread) {
+		···
+		
+		// 判断是否可以调用slab_rebalance函数
+		if (settings.slab_automove == 1 && last_automove_check != current_time) {
+			if (last_ratio != settings.slab_automove_ratio) {
+				sam->free(am);
+				am = sam->init(&settings);	 // 初始化判断所需使用的结构体
+				last_ratio = settings.slab_automove_ratio;
+			}
+			int src, dst;
+			sam->run(am, &src, &dst);	// 判断哪个slab需要转移
+			if (src != -1 && dst != -1) {
+				slabs_reassign(src, dst); // 初始化slab_rebalance线程所需使用的结构
+				LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_SLAB_MOVE, NULL, src, dst);
+			}
+			// 如果需要转移到的slab的下标为0，即转移到全局的slab中
+			// dst == 0 means reclaim to global pool, be more aggressive
+			if (dst != 0) {
+				last_automove_check = current_time;
+			} else if (dst == 0) {
+				// also ensure we minimize the thread sleep
+				to_sleep = 1000;
+			}
+		}
+	}
+	···
+	sam->free(am);
+	···
+}
+```
+上述代码中大量的使用了函数指针以及结构体，并且根据`EXTSTORE`的宏定义，采用不同的结构体函数指针来判断哪些`slabclass`需要移动`slab/chunk`。
 
+### 使用的结构体
+下面将详细介绍上述源代码中使用的结构体以及函数指针。
 
+```
+// 源代码使用的结构体---本小节不介绍EXTSTORE宏定义的部分
+typedef void *(*slab_automove_init_func)(struct settings *settings); // 初始化函数指针
+typedef void (*slab_automove_free_func)(void *arg); // 释放使用内存的函数指针
+typedef void (*slab_automove_run_func)(void *arg, int *src, int *dst); // 判断哪两个slabclass需要进行移动
 
+// 保存所有需要使用的函数指针的结构体
+typedef struct {
+	slab_automove_init_func init;
+	slab_automove_free_func free;
+	slab_automove_run_func run;
+} slab_automove_reg_t;
+
+#define MIN_PAGES_FOR_SOURCE 2
+#define MIN_PAGES_FOR_RECLAIM 2.5
+
+// 用于保存计算slab mover的窗口信息
+struct window_data {
+	uint64_t age;
+	uint64_t dirty;
+	uint64_t evicted;
+};
+
+// stats getter for slab automover
+// 在slab mover计算过程中记录item的信息,从LRU链表itemstats统计信息中获取
+typedef struct {
+	int64_t evicted;
+	int64_t outofmemory;
+	uint32_t age;
+} item_stats_automove;
+
+// 在slab mover计算过程中记录slab的信息,从slabclass数组中获取信息
+typedef struct {
+	unsigned int chunks_per_page;
+	unsigned int chunk_size;
+	long int free_chunks;
+	long int total_pages;
+} slab_stats_automove;
+
+// 用于计算slab mover的结构体
+typedef struct {
+	struct window_data *widnow_data;
+	uint32_t window_size;			// 窗口大小
+	uint32_t window_cur;			// 使用的window的下标
+	double max_age_ratio;			// 新旧比例
+	item_stats_automove iam_before[MAX_NUMBER_OF_SLAB_CLASSES]; //用于记录转移前各个slabclass对应的item信息
+	item_stats_automove iam_after[MAX_NUMBER_OF_SLAB_CLASSES]; //用于记录转移后各个slabclass对应的item信息
+	slab_stats_automove sam_before[MAX_NUMBER_OF_SLAB_CLASSES]; //用于记录转移前slabclass的对应信息
+	slab_stats_automove sam_after[MAX_NUMBER_OF_SLAB_CLASSES]; //用于记录转移后slabclass的对应信息
+} slab_automove;
+
+// 全局变量
+// 用于记录slab mover判断过程中所使用的函数指针指向函数的结构体,本小节重点
+slab_automove_reg_t slab_automove_default = {
+	.init = slab_automove_init,
+	.free = slab_automove_free,
+	.run = slab_automove_run
+};
+// 当存在EXTSTORE宏时，使用的函数指针结构体
+#ifdef EXTSTORE 
+slab_automove_reg_t slab_automove_extstore = {
+	.init = slab_automove_extstore_init,
+	.free = slab_automove_extstore_free,
+	.run = slab_automove_extstore_run
+};
+#endif
+```
+上面介绍了`LRU`维护线程调用`slabs_reassign`函数时，所使用的结构体以及全局变量。下面将介绍在`LRU`维护线程中所使用的函数指针对应的函数，从而进一步分析其原理。
+
+### 函数指针对应的函数--仅介绍`slab_automove_default`对应的函数指针
+
+初始化函数(`slab_automove_init`)用于获取`slabclass`对应的`item`信息和`slab`信息，从而能够根据这些信息来判断哪些`slabclass`需要进行移动操作。其源代码如下:
+
+```
+void *slab_automove_init(struct settings *settings) {
+	uint32_t window_size = settings->slab_automove_window;
+	double max_age_ratio = settings->slab_automove_ratio;
+	slab_automove *a = calloc(1, sizeof(slab_automove));
+	if (a == NULL)
+		return NULL;
+	a->window_data = calloc(window_size * MAX_NUMBER_OF_SLAB_CLASSES, sizeof(struct window_data));
+	a->window_size = window_size;
+	a->max_age_ratio = max_age_ratio;
+	if (a->window_data == NULL) {
+		free(a);
+		return NULL;
+	}
+	
+	// do a dry run to fill the before structs
+	// 从LRU链表的统计信息中获取,slab mover判断所需的信息
+	fill_item_stats_automove(a->iam_before);
+	// 从slabclass的统计信息中获取，slab mober判断所需的信息
+	fill_slab_stats_automove(a->sam_before);
+	
+	return (void *)a;
+}
+
+/* With refactoring of the various stats code the automover won't need a
+ * custom function here.
+ */
+void fill_item_stats_automove(item_stats_automove *am) {
+	int n;
+	for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+		itemstats_automove *cur = &am[n];
+		
+		// outofmemory records into HOT
+		// 从slabclass对应的HOT_LRU链表中获取分配不出内存的情况次数
+		int i = n | HOT_LRU;
+		pthread_mutex_lock(&lru_locks[i]);
+		cur->outofmemory = itemstats[i].outofmemory;
+		pthread_mutex_unlock(&lru_locks[i]);
+		
+		// 从slabclass对应的COLD_LRU链表中获取被移除的item个数以及最高的item的过期时间长度
+		// evictions and tail age are from COLD
+		i = n | COLD_LRU;
+		pthread_mutex_lock(&lru_locks[i]);
+		cur->evicted = itemstats[i].evicted;
+		if (tails[i]) {
+			cur->age = current_time - tails[i]->time;
+		} else {
+			cur->age = 0;
+		}
+		pthread_mutex_unlock(&lru_locks[i]);
+	}
+}
+
+/* With refactoring of the varous stats cod the automover won't need a 
+ * custom function here.
+ */
+// 从slabclass中获取判断需要的必要信息
+void fill_slab_stats_automove(slab_stats_automove *am) {
+	int n;
+	pthread_mutex_lock(&slabs_lock);
+	for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+		slabclass_t *p = &slabclass[n];
+		slab_stats_automove *cur = &am[n];
+		cur->chunks_per_page = p->perslab; // 获取每个chunk能够存放多少个item
+		cur->free_chunks = p->sl_curr; // 空闲的item个数
+		cur->total_pages = p->slabs; // slabclass_t分配了多少个chunk
+		cur->chunk_size = p->size; // slabclass_t中item的大小
+	}
+	pthread_mutex_unlock(&slabs_lock);
+}
+```
+
+前面介绍了`slab mover`判断所需要的`slab`和`item`的信息，下面看如何根据这些信息进行判断哪些`slabclass`需要进行转移操作。
+
+```
+// TODO: If oldest is dirty, find next oldest
+// still need to base ratio off of absolute age
+void slab_automove_run(void *arg, int *src, int *dst) {
+	slab_automove *a = (slab_automove *)arg;
+	int n;
+	struct window_data w_sum; // 用于计算slabclass中所有window_size的值总和
+	// 用于记录转移出的slabclass的id
+	int oldest = -1;
+	uint64_t oldest_age = 0;
+	// 用于记录转移入的slabclass的id
+	int youngest = -1;
+	uint64_t youngest_age = ~0;
+	bool youngest_evicting = false;
+	// 用于记录移入移出的slabclass的id
+	*src = -1;
+	*dst = -1;
+	
+	// 用于获取当`LRU`维护线程调用完其它过程后的状态
+	// fill after structs
+	fill_item_stats_automove(a->iam_after); // LRU链表中itemstats统计信息
+	fill_slab_stats_automove(a->sam_after); // slabclass的统计信息
+	a->window_cur++;							   // slabclass中window_data的下标
+	
+	// iterate slabs
+	// 循环便利,查找满足移出条件的slabclass和需要移入的slabclass
+	for (n = POWER_SMALLEST; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
+		// 组成slabclass对应的window_data数组的下标
+		int w_offset = n * a->window_size;
+		// 获取本次记录信息的window_data结构体地址
+		struct window_data *wd = &a->window_data[w_offset + (a->window_cur % a->window_size)];
+		memset(wd, 0, sizeof(struct window_data));
+		// summarize the window-up-to-now.
+		memset(&w_sum, 0, sizeof(struct window_data));
+		// 获取此slabclass记录的所有window_data中的信息
+		window_sum(&a->window_data[w_offset], &w_sum, a->window_size);
+		
+		// if page delta, or evicted delta, mark window dirty
+		// (or outofmemory)
+		// 此slabclass对应的COLD链表中操作前后又有item移除，或者
+		// 操作前后申请item遇见空间不足的情况
+		if (a->iam_after[n].evicted - a->iam_before[n].evicted > 0 ||
+				a->iam_after[n].outofmemory - a->iam_before[n].outofmemory > 0) {
+			wd->evicted = 1;
+			wd->dirty = 1;
+		}
+		// 此slabclass操作前后的chunk/page个数变多
+		if (a->sam_after[n].total_pages - a->sam_before[n].total_pages > 0) {
+			wd->dirty = 1;
+		}
+		
+		// set age into window
+		// 获取slabclass对应的COLD链表中最后一个item的已过期时间
+		wd->age = a->iam_after[n].age;
+		
+		// grap age as average of window total
+		// 此slabclass对应的所有window_data的平均过期时长
+		uint64_t age = w_sum.age / a->window_size;
+		
+		// if > N free chunks and not dirty, make decision
+		if (a->sam_after[n].free_chunks > a->sam_after[n].chunks_per_page * MIN_PAGES_FOR_RECLAIM) {
+			if (w_sum.dirty == 0) {
+				// 如果此slabclass的空闲item个数大于2.5个chunk/page所能包含的item个数
+				// 并且此slabclass的中没有扩张的趋势，则将此slabclass转移到GOBAL slabclass中
+				*src = n;
+				*dst = 0;
+				break;
+			}
+		}
+		
+		// 用于判断此slabclass是否符合移除chunk/page的条件
+		if (age > oldest_age && a->sam_after[n].total_pages > MIN_PAGES_FOR_SOURCE) {
+			oldest = n;
+			oldest_age = age;
+		}
+		
+		// grab evicted count from window
+		// if > half the window and youngest, mark as youngest
+		// 用于判断此slabclass是否符合移入的chunk/page的条件
+		if (age < youngest_age && w_sum.evicted > a->window_size / 2) {
+			youngest = n;
+			youngest_age = age;
+			youngest_evicting = wd->evicted ? true : false;
+		}
+	}
+	
+	memcpy(a->iam_before, a->iam_after, sizeof(item_stats_automove) * MAX_NUMBER_OF_SLAB_CLASSES);
+	memcpy(a->sam_before, a->sam_after, sizeof(slab_stats_automove) * MAX_NUMBER_OF_SLAB_CLASSES);
+	// if we have a youngest and oldest, and oldest is outside the ratio,
+	// also, only make decisions if window has filled once.
+	// 判断移除移入的slabclass是否满足条件
+	if (youngest != -1 && oldest != -1 && a->window_cur > a->window_size) {
+		if (youngest_age < ((double)oldest_age * a->max_age_ratio) && youngest_evicting) {
+			*src = oldest;
+			*dst = youngest;
+		}
+	}
+	return;
+}
+
+static void window_sum(struct window_data *wd, struct window_data *w, uint32_t size) {
+	int x;
+	for (x = 0; x < size; x++) {
+		struct window_data *d = &wd[x];
+		w->age += d->age;
+		w->dirty += d->dirty;
+		w->evicted += d->evicted;
+	}
+}
+```
+通过上面的代码可以看出，查找满足移除移入条件的`slabclass`是根据此`slabclass`在一段时间内(`window_size`)的移除`item`或者`COLD`链表末尾`item`已过期时间来判断的。因此可知都是通过一段时间的统计而形成的结果。
+
+释放统计信息的函数如下:
+
+```
+// 释放所有的空间
+void slab_automove_free(void *arg) {
+	slab_automove *a = (slab_automove *)arg;
+	free(a->window_data);
+	free(a);
+}
+```
+
+## 结语
+`LRU`维护线程共拥有4个功能，其中最后两个功能对维护`LRU`和`slabclass`具有非常重要的作用。`LRU`维护线程也是调用`LRU`扫描线程和`slab_rebalance`线程的重要入口。可见对于`memcached`代码中，此线程的功能极其重要。
 
