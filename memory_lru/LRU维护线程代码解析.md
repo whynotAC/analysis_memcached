@@ -931,7 +931,7 @@ static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
 
 `lru_maintainer_thread`函数--->`lru_maintainer_crawler_check`函数--->`lru_crawler_start`函数--->`do_lru_crawler_start`函数
 
-## 使用的结构体
+### 使用的结构体
 通过代码可以看出此调用链中存在大量的结构体和全局变量，这些结构体/变量在函数中起了很重要的作用。我们将对这些信息进行逐一解释和分析。
 
 ```
@@ -1012,7 +1012,7 @@ typedef struct {
 	int				nbytes;		// size of data
 	unsigned short refcount;
 	uint8_t		nsuffix;		// length of flags-and-length string
-	uint8_t		it_flags;		// ITEM_* above
+	uint8_t		it_flags;		// it_flags = 1时，表示此LRU正在被扫描
 	uitn8_t		slabs_clsid;	// which salb class we're in
 	uint8_t		nkey;			// key length, w/terminating null and padding
 	uint8_t		remaining;	// Max keys to crawl per slab invocation
@@ -1030,14 +1030,43 @@ crawler_module_reg_t crawler_expired_mod = {
 	.needs_lock = true,
 	.needs_client = false
 };
-
+// crawler扫描线程CRAWLER_METADUMP工作方式下的工作函数
 crawler_module_reg_t *crawler_metadump_mod = {
 	.init = NULL,
 	.eval = crawler_metadump_eval,
 	.doneclass = NULL,
-	.finalize = crawler_metadump_
+	.finalize = crawler_metadump_finalize,
+	.needs_lock = false,
+	.needs_client = true
 };
+
+// 所有crawler线程工作方式的数组函数
+crawler_module_reg_t *crawler_mod_regs[3] = {
+	&crawler_expired_mod,			// CRAWLER_AUTOEXPIRE工作方式使用的函数，本小节将使用的
+	&crawler_expired_mod,			// CRAWLER_EXPIRED工作方式使用的函数
+	&crawler_metadump_mod			// CRAWLER_METADUMP工作方式使用的函数
+};
+
+// 用于保存正在使用的crawler工作方式以及对应函数等信息
+crawler_module_t active_crawler_mid;	// crawler扫描线程当前使用的结构
+enum crawler_run_type active_crawler_type; // crawler扫描线程的工作方式
+
+// 用于存放crawler扫描线程使用的伪item
+static crawler crawlers[LARGEST_ID];
+
+static int crawler_count = 0; // crawler需要扫描的LRU链表的个数
+static volatile int do_run_lru_crawler_thread = 0; // crawler线程是否在运行
+static int lru_crawler_initialized = 0;	// crawler初始化静态变量
+static pthread_mutex_t lru_crawler_lock = PTHREAD_MUTEX_INITIALIZER; // 锁
+static ptherad_cond_t  lru_crawler_cond = PTHREAD_COND_INITIALIZER; // 条件变量
 ```
+
+### 流程图示
+
+上面讲述完了`crawler`所使用的结构体，本小节将整个调用流程的主要功能以图示的方式来展现调用链。
+
+![伪ITEM插入LRU链表的图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/crawler扫描线程的伪ITEM.png)
+
 
 
 
