@@ -326,10 +326,183 @@ struct _crawler_module_t {
 	crawler_client_t c;
 	crawler_module_reg_t *mod;
 };
+
+// crawler线程以CRAWLER_AUTOEXPIRE/CRAWLER_EXPIRED方式进行工作使用的结构体
+crawler_module_reg_t crawler_expired_mod = {
+	.init = crawler_expired_init,			// 初始化函数
+	.eval = crawler_expired_eval,			// 判断item是否过期函数
+	.doneclass = crawler_expired_doneclass, // LRU链表完成时调用的函数
+	.finalize = crawler_expired_finalize,   // crawler线程所描完所有LRU链表结束时调用
+	.needs_lock = true,			// 是否使用锁
+	.needs_client = false		// 是否使用客户端
+};
+
+// crawler线程以CRAWLER_METADUMP方式进行工作使用的结构体
+crawler_module_reg_t crawler_metadump_mod = {
+	.init = NULL,
+	.eval = crawler_metadump_eval,
+	.doneclass = NULL,
+	.finalize = crawler_metadump_finalize,
+	.needs_lock = false,
+	.needs_client = true
+};
+
+// 所有工作方式使用的函数指针
+crawler_module_reg_t *crawler_mod_regs[3] = {
+	&crawler_expired_mod,		//	CRAWLER_AUTOEXPIRE工作方式
+	&crawler_expired_mod,		// CRAWLER_EXPIRED工作方式
+	&crawler_metadump_mod		// CRAWLER_METADUMP工作方式
+};
+
+// 全局变量
+crawler_module_t active_crawler_mod;	// crawler线程使用的函数方式
+enum crawler_run_type active_crawler_type; // crawler线程的工作方式
+
+static crawler crawlers[LARGEST_ID];	 // crawler线程使用的伪ITEM存放的数组
+
+static int crawler_count = 0; // crawler需要扫描的LRU链表的个数
+static volatile int do_run_lru_crawler_thread = 0; // 判断线程是否在运行
+static int lru_crawler_initialized = 0; // crawler线程是否初始化使用的变量
+static pthread_mutex_t lru_crawler_lock = PTHEAD_MUTEX_INITIALIZER; // 锁
+static pthread_cond_t lru_crawler_cond = PTHREAD_COND_INITIALIZER; // 变量
 ```
 
 4 crawler源代码解析
 -----------------------------------------
+前面介绍了`cralwer`线程的各个方面，包括线程的启动\关闭、其被调用的方式、使用的全局变量等等信息。下面将着重介绍`cralwer`线程本身，将介绍其工作方式以及整个函数的工作流程。
+
+```
+static void *item_crawler_thread(void *arg) {
+	int i;
+	int crawls_persleep = settings.crawls_persleep;
+	
+	pthread_mutex_lock(&lru_crawler_lock);
+	pthread_cond_signal(&lru_crawler_cond);
+	settings.lru_crawler = true;
+	if (settings.verbose > 2)
+		fprintf(stderr, "Starting LRU crawler background thread\n");
+	while (do_run_lru_crawler_thread) {	 // 进入crawler线程工作循环中
+	pthread_cond_wait(&lru_crawler_cond, &lru_crawler_lock); // 等待条件变量运行
+	
+	while (crawler_count) {    // 根据需要扫描的LRU链表个数来循环，当所有需要扫描的LRU链表扫描完成后，退出循环
+		item *search = NULL;	 // 用于记录需要判断的item
+		void *hold_lock = NULL;	  // item对应的hash锁
+		
+		for (i = POWER_SMALLEST; i < LARGEST_ID; i++) {  // 逐一扫描LRU链表
+			if (crawlers[i].it_flags != 1) { // 根据伪ITEM来判断此LRU链表是否需要扫描
+				continue;
+			}
+			
+			// Get memory from bipbuf, if client has no space, flush
+			// crawler线程以CRAWLER_METADUMP方式工作时需要考虑client客户端
+			if (active_crawler_mod.c.c != NULL) {
+				// 判断客户端的发送信息失败时将LRU链表扫描结束
+				int ret = lru_crawler_client_getbuf(&active_crawler_mod.c);
+				if (ret != 0) {
+					lru_crawler_class_done(i);
+					continue;
+				}
+			} else if (active_crawler_mod.mod->needs_client) {
+				// 如果client关闭了，则此LRU链表扫描结束
+				lru_crawler_class_done(i);
+				continue;
+			}
+			pthread_mutex_lock(&lru_locks[i]);
+			// 移动伪ITEM,返回伪ITEM后的item用于判断
+			search = do_item_crawl_q((item *)&crawlers[i]);
+			// 判断此LRU链表是否扫描结束
+			if (search == NULL ||
+					(crawlers[i].remaining && --crawlers[i].remaining < 1) {
+				if (settings.verbose > 2)
+					fprintf(stderr, "Nothing left to crawl fro %d\n", i);
+				lru_crawler_class_done(i);
+				continue;
+			}
+			uint32_t hv = hash(ITEM_key(search), search->nkey);
+			/* Attempt to hash item lock the 'search' item. If locked, no
+			 * other callers can incr the refcount
+			 */
+			 // 获取此item对应的hash锁
+			 if ((hold_lock = item_trylock(hv)) == NULL) {
+			 	pthread_mutex_unlock(&lru_locks[i]);
+			 	continue;
+			 }
+			 // Now see if the item is refcount locked
+			 // 判断此item是否被其它线程使用中
+			 if (refcount_incr(search) != 2) {
+			 	refcount_decr(search);
+			 	if (hold_lock)
+			 		item_trylock_unlock(hold_lock);
+			 	pthread_mutex_unlock(&lru_locks[i]);
+			 	continue;
+			 }
+			 
+			 crawlers[i].checked++;  // 通过伪ITEM的checked字段来记录扫描的item个数
+			 /* Frees the item or decrements the refcount. */
+			 /* Interface for this could improve: do the free/decr here
+			  * instead? */
+			 // 判断item是否过期时，是否需要加锁
+			 if (!active_crawler_mod.mod->needs_lock) {
+			 	pthread_mutex_unlock(&lru_locks[i]);
+			 }
+			 // 判断item是否满足过期条件
+			 active_crawler_mod.mod->eval(&active_crawler_mod, search, hv, i);
+			 
+			 // 释放锁
+			 if (hold_lock)
+			 	item_trylock_unlock(hold_lock);
+			 if (active_crawler_mod.mod->needs_lock) {
+			 	pthread_mutex_unlock(&lru_locks[i]);
+			 }
+			 // 判断crawler线程是否需要usleep
+			 if (crawls_persleep-- <= 0 && settings.lru_crawler_sleep) {
+			 	pthread_mutex_unlock(&lru_crawler_lock);
+			 	usleep(settings.lru_crawler_sleep);
+			 	pthread_mutex_lock(&lru_crawler_lock);
+			 	crawls_persleep = settings.crawls_persleep;
+			 } else if (!settings.lru_crawler_sleep) {
+			 	// TODO: only cycle lock every N？
+			 	pthread_mutex_unlock(&lru_crawler_lock);
+			 	pthread_mutex_lock(&lru_crawler_lock);
+			 }
+		}
+	} // while (crawler_count) 所有需要扫描的LRU链表扫描结束
+	// 清空crawler线程所使用的active_crawler_mod全局变量
+	if (active_crawler_mod.mod != NULL) {
+		// crawler线程扫描完所有LRU链表时使用finalize函数
+		if (active_crawler_mod.mod->finalize != NULL)
+			active_crawler_mod.mod->finalize(&active_crawler_mod);
+		// 判断client是否需要清空结束
+		while (active_crawler_mod.c.c != NULL && bipbuf_used(active_crawler_mod.c.buf)) {
+			lru_crawler_poll(&active_crawler_mod.c);
+		}
+		// Double checking in case the client closed during the poll
+		if (active_crawler_mod.c.c != NULL) {
+			lru_crawler_release_client(&active_crawler_mod.c);
+		}
+		active_crawler_mod.mod = NULL;
+	}
+	
+	if (settings.verbose > 2)
+		fprintf(stderr, "LRU crawler thread sleeping\n");
+	
+	STATS_LOCK();
+	stats_state.lru_crawler_running = false; // crawler线程本次扫描LRU链表结束
+	STATS_UNLOCK();
+	} // while (do_run_lru_crawler_thread)
+	pthread_mutex_unlock(&lru_crawler_lock);
+	if (settings.verbose > 2)
+		fprintf(stderr, "LRU crawler thread stopping\n");
+		
+	return NULL;
+}
+```
+从上面的代码可以看出当`crawler`线程以`CRAWLER_AUTOEXPIRE/CRAWLER_EXPIRED`方式工作时，不需要使用`client`，此时代码较为简单:仅仅从`LRU`链表尾部往前逐一移动伪`ITEM`，然后返回伪`ITEM`后面的`item`，当伪`ITEM`移动到`LRU`链表头部时扫描结束。
+
+### `crawler`工作流程图示
+
+
+
 5 crawler的工作方式以及其对应的函数
 -----------------------------------------
 6 总结
