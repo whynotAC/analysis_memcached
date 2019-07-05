@@ -371,6 +371,8 @@ static pthread_cond_t lru_crawler_cond = PTHREAD_COND_INITIALIZER; // 变量
 -----------------------------------------
 前面介绍了`cralwer`线程的各个方面，包括线程的启动\关闭、其被调用的方式、使用的全局变量等等信息。下面将着重介绍`cralwer`线程本身，将介绍其工作方式以及整个函数的工作流程。
 
+`crawler`线程需要从后往前逐一扫描`item`来进行判断，众所周知链表结构是没有办法做到随机访问的。这里使用了伪`ITEM`，从而使`crawler`线程可以从容的从后往前扫描`LRU`链表中的所有`item`进行处理。这种方法提升访问`item`的速度，并且减少了`LRU`链表加锁的时间，有利于高并发的实现。
+
 ```
 static void *item_crawler_thread(void *arg) {
 	int i;
@@ -726,7 +728,7 @@ static int crawler_expired_init(crawler_module_t *cm, void *data) {
 	return 0;
 }
 
-// 判断item函数
+// 判断item是否过期函数
 /* I pulled this out to make the main thread clearer, but it reaches into the
  * main thread's values too much. Should rethink again.
  */
@@ -751,7 +753,7 @@ static void crawler_expired_eval(crawler_module_t *cm, item *search, uint32_t hv
 #endif
 	) {
 		crawlers[i].reclaimed++;	// 记录item过期的个数
-		s->reclaimed++;
+		s->reclaimed++;				// crawler_stats记录item过期的个数
 		
 		if (setting.verbose > 1) {
 			int ii;
@@ -791,7 +793,82 @@ static void crawler_expired_eval(crawler_module_t *cm, item *search, uint32_t hv
 	}
 	pthread_mutex_unlock(&d->lock);
 }
+
+// 某个LRU链表扫描完毕时调用
+static void crawler_expired_doneclass(crawler_module_t *cm, int slab_cls) {
+	// 获取crawler线程使用的结构体中crawler_expired_data
+	struct crawler_expired_data *d = (struct crawler_expired_data *)cm->data;
+	// 记录LRU链表的结束时间
+	pthread_mutex_lock(&d->lock);
+	d->crawlerstats[slab_cls].end_time = current_time; // LRU链表扫描结束时间
+	d->crawlerstats[slab_cls].run_complete = true;    // LRU链表扫描结束
+	pthread_mutex_unlock(&d->lock);
+}
+
+// 当crawler线程完成所有扫描后调用函数
+static void crawler_expired_finalize(crawler_module_t *cm) {
+	// 获取crawler线程使用的结构体中crawler_expired_data
+	struct crawler_expired_data *d = (struct crawler_expired_data *)cm->data;
+	pthread_mutex_lock(&d->lock);
+	d->end_time = current_time;	// 任务的结束时间
+	d->crawl_complete = true;		// 任务的结束标志
+	pthread_mutex_unlock(&d->lock);
+	
+	// 判断crawler_expired_data结构是由哪个线程申请的
+	if (!d->is_external) {
+		free(d);
+	}
+}
 ```
+`crawler`线程以`CRAWLER_METADUMP`工作方式时，使用的函数指针如下所示:
+
+```
+// 判断item是否过期的函数
+static void crawler_metadump_eval(crawler_module_t *cm, item *it, uint32_t hv, int i) {
+	// int slab_id = CLEAR_LRU(i);
+	char keybuf[KEY_MAX_LENGTH * 3 + 1];
+	int is_flushed = item_is_flushed(it);
+	// Ignore expired content,判断item是否过期
+	if ((it->exptime != 0 && it->exptime < current_time) 
+			|| is_flushed) {
+		refcount_decr(it);
+		return;
+	}
+	// TODO: uriencode directly into the buffer
+	uriencode(ITEM_key(it), keybuf, it->nkey, KEY_MAX_LENGTH * 3 + 1);
+	// 将item内容格式化到client的cbuf中
+	int total = snprintf(cm->c.cbuf, 4096,
+			"key=%s exp=%ld la=%llu cas=%llu fetch=%s cls=%u size=%lu\n",
+			keybuf,
+			(it->exptime == 0) ? -1 : (long)(it->exptime + process_started),
+			(unsigned long long)(it->time + process_started),
+			(unsigned long long)ITEM_get_cas(it),
+			(it->it_flags & ITEM_FETCHED) ? "yes" : "no",
+			ITEM_clsid(it),
+			(unsigned long) ITEM_ntotal(it));
+	refcount_decr(it);
+	// TODO: some way of tracking the errors. these are very unlinkely though.
+	if (total >= LRU_CRAWLER_WRITEBUF - 1 || total <= 0) {
+		// Failed to write, don't push it
+		return;
+	}
+	bipbuf_push(cm->c.buf, total);  // 添加格式化内容的长度
+}
+
+// crawler处理结束时调用
+static void crawler_metadump_finalize(crawler_module_t *cm) {
+	if (cm->c.c != NULL) {
+		// Ensure space for final message.
+		lru_crawler_client_getbuf(&cm->c);  // 切换到字符串尾部
+		memcpy(cm->c.cbuf, "END\r\n", 5); // 拷贝结束字符
+		bipbuf_push(cm->c.buf, 5);
+	}
+}
+```
+上面介绍了`crawler`线程的三种工作方式，以及其对应使用的函数。
 
 6 总结
 -----------------------------------------
+`crawler`线程有三种工作方式，其由`lru`维护线程以及客户端命令来控制其执行。外界调用`do_lru_crawler_start`函数来将伪`ITEM`放入到需要检测的`LRU`链表的尾部，然后释放`lru_crawler_cond`信号量来唤醒`crawler`线程。`crawler`线程，从后往前依次扫描带有伪`ITEM`的`LRU`队列，利用`active_crawler_mod`的函数指针来判断`item`是否需要进行处理。
+
+`crawler`线程至少每小时执行一次来判断接下来将要过期的`item`的数量。
