@@ -499,11 +499,299 @@ static void *item_crawler_thread(void *arg) {
 ```
 从上面的代码可以看出当`crawler`线程以`CRAWLER_AUTOEXPIRE/CRAWLER_EXPIRED`方式工作时，不需要使用`client`，此时代码较为简单:仅仅从`LRU`链表尾部往前逐一移动伪`ITEM`，然后返回伪`ITEM`后面的`item`，当伪`ITEM`移动到`LRU`链表头部时扫描结束。
 
-### `crawler`工作流程图示
+### `crawler`函数流程图示
 
+![crawler线程流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/crawler线程流程图示.png)
 
+### `crawler`中伪`ITEM`移动流程图示
+
+![crawler线程ITEM移动流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/memory_lru/crawler线程中执行图示.png)
+
+### 线程中调用的函数
+在`crawler`扫描线程中使用了大量函数，本小节将介绍一下其使用的函数。
+
+```
+// lru_crawler_client_getbuf函数,获取client的buf，如果没有空间，则清空原来的空间。
+static int lru_crawler_client_getbuf(crawler_client_t *c) {
+	void *buf = NULL;
+	if (c->c == NULL) return -1;
+	/* not enough space. */
+	while ((buf = bipbuf_request(c->buf, LRU_CRAWLER_WRITEBUF)) == NULL) {
+		// TODO: max loops before closing
+		int ret = lru_crawler_poll(c);  // 清空client的buf
+		if (ret < 0) return ret;
+	}
+	
+	c->cbuf = buf;
+	return 0;
+}
+
+// 当LRU链表被扫描万时调用
+static void lru_crawler_class_done(int i) {
+	crawlers[i].it_flags = 0;		// 将伪ITEM的it_flags置为0,用于标示此LRU链表不需要LRU链表扫描
+	crawler_count--;	// 减少需要扫描的LRU链表的个数
+	do_item_unlinktail_q((item *)&crawlers[i]); // 将伪ITEM从LRU链表中去除
+	// 将LRU扫描的结果保存到itemstats中LRU链表对应的位置中
+	do_item_stats_add_crawl(i, crawlers[i].reclaimed, crawlers[i].unfetched, crawlers[i].checked);
+	pthread_mutex_unlock(&lru_locks[i]);
+	if (active_crawler_mod.mod->doneclass != NULL)
+		active_crawler_mod.mod->doneclass(&active_crawler_mod, i);
+}
+
+// 将伪ITEM在LRU链表中从后往前逐步移动
+/* This is too convoluted, but it's a difficult shuffle. Try to rewrite it
+ * more clearly.
+ */
+item *do_item_crawl_q(item *it) {
+	item **head, **tail;
+	assert(it->it_flags == 1);
+	assert(it->nbytes == 0);
+	head = &heads[it->slabs_clsid];
+	tail = &tails[it->slabs_clsid];
+	
+	/* We've hit the head, pop off */
+	if (it->prev == 0) {
+		assert(*head == it);
+		if (it->next) {
+			*head = it->next;
+			assert(it->next->prev == it);
+			it->next->prev = 0;
+		}
+		return NULL; // Done
+	}
+	
+	/* Swing ourselves in front of the next item */
+	/* NB: If there is a prev, we can't be the head */
+	assert(it->prev != it);
+	if (it->prev) {
+		if (*head == it->prev) {
+			/* Prev was the head, now we're the head */
+			*head = it;
+		}
+		if (*tail == it) {
+			/* We are the tail, now they are the tail */
+			*tail = it->prev;
+		}
+		assert(it->next != it);
+		if (it->next) {
+			assert(it->prev->next == it);
+			it->prev->next = it->next;
+			it->next->prev = it->prev;
+		} else {
+			/* Tail. Move this above? */
+			it->prev->next = 0;
+		}
+		/* prev->prev's next is it->prev */
+		it->next = it->prev;
+		it->prev = it->next->prev;
+		it->next->prev = it;
+		/* New it->prev now, if we're not at the head. */
+		if (it->prev) {
+			it->prev->next = it;
+		}
+	}
+	assert(it->next != it);
+	assert(it->prev != it);
+	
+	return it->next; /* success */
+}
+
+// 判断client中buf是否存在空闲空间
+int bipbuf_used(const bipbuf_t *me) {
+	return (me->a_end - me->a_start) + me->b_end;
+}
+
+// crawler线程中的poll函数
+static int lru_crawler_poll(crawler_client_t *c) {
+	unsigned char *data;
+	unsigned int data_size = 0;
+	struct pollfd to_poll[1];
+	to_poll[0].fd = c->sfd;
+	to_poll[0].events = POLLOUT;
+	
+	int ret = poll(to_poll, 1, 1000);
+	
+	if (ret < 0) {
+		// fatal.
+		return -1;
+	}
+	
+	if (ret == 0) return 0;
+	
+	if (to_poll[0].revents & POLLIN) {
+		char buf[1];
+		int res = read(c->sfd, buf, 1);
+		if (res == 0 || (res == -1 && (errno != EAGAIN && errno != EWOULDBLOCK))) {
+			lru_crawler_close_client(c);
+			return -1;
+		}
+	}
+	if ((data = bipbuf_peek_all(c->buf, &data_size)) != NULL) {
+		if (to_poll[0].revents & (POLLHUP|POLLERR)) {
+			lru_crawler_close_client(c);
+			return -1;
+		} else if (to_poll[0].revents & POLLOUT) {
+			int total = write(c->sfd, data, data_size);
+			if (total == -1) {
+				if (errno != EAGAIN && errno != EWOULDBLOCK) {
+					lru_crawler_close_client(c);
+					return -1;
+				}
+			} else if (total == 0) {
+				lru_crawler_close_client(c);
+				return -1;
+			} else {
+				bipbuf_poll(c->buf, total);
+			}
+		}
+	}
+	return 0;
+}
+
+// 关闭链接和客户端
+static void lru_crawler_release_client(crawler_client_t *c) {
+	// 释放链接
+	redispatch_conn(c->c);
+	c->c = NULL;
+	c->cbuf = NULL;
+	bipbuf_free(c->buf);
+	c->buf = NULL;
+}
+```
 
 5 crawler的工作方式以及其对应的函数
 -----------------------------------------
+前面介绍了`crawler`的工作流程以及工作函数，本小节将介绍`crawler`线程的工作方式以及其对应的使用的函数。
+
+`crawler`线程工作方式有以下三种:
+
+```
+// TODO: If we eventually want user loaded modules, we can't use an enum
+enum crawler_run_type {
+	CRAWLER_AUTOEXPIRE=0,
+	CRAWLER_EXPIRED,
+	CRAWLER_METADUMP
+};
+
+// CRAWLER_AUTOEXPIRE/CRAWLER_EXPIRED工作方式时，使用的函数指针
+crawler_module_reg_t crawler_expired_mod = {
+	.init = crawler_expired_init,
+	.eval = crawler_expired_eval,
+	.doneclass = crawler_expired_doneclass,
+	.finalize = crawler_expired_finalize,
+	.needs_lock = true,
+	.needs_client = false
+};
+
+// CRAWLER_METADUMP工作方式时，使用的函数指针
+crawler_module_reg_t crawler_metadump_mod = {
+	.init = NULL,
+	.eval = crawler_metadump_eval,
+	.doneclass = NULL,
+	.finalize = crawler_metadump_finalize,
+	.needs_lock = false,
+	.needs_client = true
+};
+```
+`crawler`线程以`CRAWLER_AUTOEXPIRE/CRAWLER_EXPIRED`工作方式时，使用的函数指针如下所示:
+
+```
+// 初始化函数
+static int crawler_expired_init(crawler_module_t *cm, void *data) {
+	struct crawler_expired_data *d;
+	if (data != NULL) {
+		d = data;
+		d->is_external = true;
+		cm->data = data;
+	} else {
+		// allocate data
+		d = calloc(1, sizeof(struct crawler_expired_data));
+		if (d == NULL) {
+			return -1;
+		}
+		// init lock.
+		pthread_mutex_init(&d->lock, NULL);
+		d->is_external = false;
+		d->start_time = current_time;
+		
+		cm->data = d;
+	}
+	pthread_mutex_lock(&d->lock);
+	memset(&d->crawlerstats, 0, sizeof(crawlerstats_t) * POWER_LARGEST);
+	for (int x = 0; x < POWER_LARGEST; x++) {
+		d->crawlerstats[x].start_time = current_time;
+		d->crawlerstats[x].run_complete = false;
+	}
+	pthread_mutex_unlock(&d->lock);
+	return 0;
+}
+
+// 判断item函数
+/* I pulled this out to make the main thread clearer, but it reaches into the
+ * main thread's values too much. Should rethink again.
+ */
+static void crawler_expired_eval(crawler_module_t *cm, item *search, uint32_t hv, int i) {
+	struct crawler_expired_data *d = (struct crawler_expired_data *)cm->data;
+	pthread_mutex_lock(&d->lock);
+	crawlerstats_t *s = d->crawlerstats[i]; // 获取LRU链表对应的crawlerstats_t
+	int is_flushed = item_is_flushed(search); // 判断是否接受过客户端flushed命令
+#ifdef EXTSTORE
+	bool is_valid = true;
+	if (search->it_flags & ITEM_HDR) {
+		item_hdr *hdr = (item_hdr *)ITEM_data(search);
+		if (extstore_check(storage, hdr->page_id, hdr->page_version) != 0)
+			is_valid = false;
+	}
+#endif
+	// 判断item是否过期
+	if ((search->exptime != 0 && search->exptime < current_time)
+			|| is_flushed
+#ifdef EXTSTORE
+			|| is_valid
+#endif
+	) {
+		crawlers[i].reclaimed++;	// 记录item过期的个数
+		s->reclaimed++;
+		
+		if (setting.verbose > 1) {
+			int ii;
+			char *key = ITEM_key(search);
+			fprintf(stderr, "LRU crawler found on expired item (flags: %d, slab: %d): ", search->it_flags, search->slabs_clsid);
+			for (ii = 0; ii < search->nkey; ++ii) {
+				fprintf(stderr, "%c", key[ii]);
+			}
+			fprintf(stderr, "\n");
+		}
+		if ((search->it_flags & ITEM_FETCHED) == 0 && !is_flushed) {
+			crawlers[i].unfetched++; // 记录item在被移除之前未被访问过的个数
+		}
+#ifdef EXTSTORE
+		STORAGE_delete(storage, search);
+#endif
+		do_item_unlink_nolock(search, hv); // item从链接中去除
+		do_item_remove(search); // 释放item
+		assert(search->slabs_clsid == 0);
+	} else {
+		// item未过期
+		s->seen++;	//	item中未过期的item个数
+		refcount_decr(search);
+		if (search->exptime == 0) {
+			s->noexp++;		// item永不过期的个数
+		} else if (search->exptime - current_time > 3599) {
+			s->ttl_hourplus++;		// item的超时时间超过1hour的个数
+		} else {
+			// 判断item在未来一小时中那一分钟过期
+			rel_time_t ttl_remain = search->exptime - current_time;
+			// 将item放入对应的过期桶中
+			int bucket = ttl_remain / 60;	// 判断那一分钟过期
+			if (bucket <= 60) {
+				s->histo[bucket]++;  // 记录每分钟过期的item个数
+			}
+		}
+	}
+	pthread_mutex_unlock(&d->lock);
+}
+```
+
 6 总结
 -----------------------------------------
