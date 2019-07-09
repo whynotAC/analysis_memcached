@@ -155,6 +155,23 @@ static void *worker_libevent(void *arg) {
 }
 
 /*
+ * Processes on incoming "handle a new connection" item. This is called when
+ * input arrives on the libevent wakeup pipe.
+ */
+static void thread_libevent_process(int fd, short which, void *arg) {
+    LIBEVENT_THREAD *me = arg;
+    CQ_ITEM *item;
+    char buf[1];
+    conn *c;
+    unsigned int timeout_fd;
+
+    if (read(fd, buf, 1) != 1) {
+        
+    }
+}
+
+
+/*
  * Initialize the thread subsystem, creating various worker threads.
  *
  * nthreads Number of worker event handler threads to spawn
