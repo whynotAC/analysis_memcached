@@ -412,6 +412,174 @@ static void clock_handler(const int fd, const short which, void *arg) {
     }
 }
 
+// 状态机处理connection的事件
+static void drive_machine(conn *c) {
+    bool stop = false;
+    int sfd;
+    socklen_t addrlen;
+    struct sockaddr_storage addr;
+    int nreqs = settings.reqs_per_event;
+    int res;
+    const char *str;
+#ifdef HAVE_ACCEPT4
+    static int use_accept4 = 1;
+#else
+    static int use_accept4 = 0;
+#endif
+
+    assert(c != NULL);
+
+    // 状态机
+    while (!stop) {
+        
+        // 根据conneciton的state来判断需要做什么处理
+        switch (c->state) {
+        case conn_listening:    // 主线程中connection接收新的链接
+            addrlen = sizeof(addr);
+            // 用非阻塞网络套接字accept新connection
+#ifdef HAVE_ACCEPT4
+            if (use_accept4) {
+                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+            } else {
+                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+            }
+#else
+            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+#endif
+            if (sfd == -1) {
+                if (use_accept4 && errno == ENOSYS) {
+                    use_accept4 = 0;
+                    continue;
+                }
+                perror(use_accept4 ? "accept4()" : "accept()");
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // these are transient, so don't log anything
+                    stop = true;
+                } else if (errno == EMFILE) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Too many open connections\n");
+                    accept_new_conns(false);
+                    stop = true;
+                } else {
+                    perror("accept()");
+                    stop = true;
+                }
+                break;
+            }
+            if (!use_accept4) {
+                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
+                    perror("setting O_NONBLOCK");
+                    close(sfd);
+                    break;
+                }
+            }
+
+            if (settings.maxconns_fast &&
+                    stats_state.curr_conns + stats_state.reserved_fds >=
+                        settings.maxconns - 1) {
+                str = "ERROR Too many open connections\r\n";
+                res = write(sfd, str, strlen(str));
+                close(sfd);
+                STATS_LOCK();
+                stats.rejected_conns++;
+                STATS_UNLOCK();
+            } else {
+                dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+                                        DATA_BUFFER_SIZE, c->transport);
+            }
+
+            stop = true;
+            break;
+
+        case conn_waiting:
+            if (!update_event(c, EV_READ | EV_PERSIST)) {
+                if (settings.verbose > 0)
+                    fprintf(stderr, "Couldn't update event\n");
+                conn_set_state(c, conn_closing);
+                break;
+            }
+
+            conn_set_state(c, conn_read);
+            stop = true;
+            break;
+
+        case conn_read:
+            // 读取处理，与本无关，因此省略
+            break;
+
+        case conn_parse_cmd:
+            // 读取处理，与本无关，因此省略
+            break;
+
+        case conn_new_cmd:
+            // 读取处理，与本无关，因此省略
+            break;
+
+        case conn_nread:
+            // 读取处理，与本无关，因此省略
+            break;
+
+        case conn_swallow:
+            // 读取处理，与本无关，因此省略
+            break;
+
+        case conn_write:
+            // 读取处理，与本无关，因此省略
+            break;
+
+        case conn_mwrite:
+            // 读取处理，与本无关，因此省略
+            break;
+
+        case conn_closing:
+            if (IS_UDP(c->transport))
+                conn_cleanup(c);
+            else
+                conn_close(c);
+            stop = true;
+            break;
+        
+        case conn_closed:
+            // This only happens if dormando is an idiot.
+            abort();
+            break;
+
+        case conn_watch:
+            // we handed off our connection to the logger thread.
+            stop = true;
+            break;
+        case conn_max_state:
+            assert(false);
+            break;
+        }
+    }
+
+    return;
+}
+
+// 主connection以及链接的connection的处理函数
+static void event_handler(const int fd, const short which, void *arg) {
+    conn *c;
+
+    c = (conn *)arg;
+    assert(c != NULL);
+
+    c->which = which;
+
+    /* sanity */
+    if (fd != c->sfd) {
+        if (settings.verbose > 0)
+            fprintf(stderr, "Catastrophic: even fd doesn't match conn fd\n");
+        conn_close(c);
+        return;
+    }
+    // 状态机来处理connection的事件
+    dirver_machine(c);
+
+    // wait for next event
+    return;
+}
+
 /*
  * Create a socket and bind it to a specific port number
  * @param interface the interface to bind to
