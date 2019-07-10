@@ -44,6 +44,24 @@ static int init_count = 0;
 static pthread_mutex_t init_lock;
 static pthread_cond_t init_cond;
 
+// 主线程等待子线程启动完毕
+static void wait_for_thread_registration(int nthreads) {
+    while (init_count < nthreads) {
+        pthread_cond_wait(&init_cond, &init_lock);
+    }
+}
+
+// 子线程通知主线程启动完毕
+static void register_thread_initialized(void) {
+    pthread_mutex_lock(&init_lock);
+    init_count++;
+    pthread_cond_signal(&init_cond);
+    pthread_mutex_unlock(&init_lock);
+    // Force worker threads to pile up if someone wants us to
+    pthread_mutex_lock(&worker_hang_lock);
+    pthread_mutex_unlock(&worker_hang_lock);
+}
+
 /*
  * Initializes a connection queue
  */
@@ -222,15 +240,17 @@ static void *worker_libevent(void *arg) {
     /* Any per-thread setup can happen here; memcached_thread_init() will block
      * until all threads have finished initializing.
      */
-    me->l = logger_create();
+    // 本次不介绍,故隐去
+    //me->l = logger_create();
     me->lru_bump_buf = item_lru_bump_buf_create();
     if (me->l == NULL || me->lru_bump_buf == NULL) {
         abort();
     }
-
-    if (settings.drop_privileges) {
+    
+    // 本次不介绍,故隐去
+    /*if (settings.drop_privileges) {
         drop_worker_privileges();
-    }
+    }*/
 
     register_thread_initialized();
 
