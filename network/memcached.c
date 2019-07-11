@@ -141,6 +141,47 @@ static void *conn_timeout_thread(void *arg) {
     return NULL;
 }
 
+void conn_close_idle(conn *c) {
+    if (setting.idle_timeout > 0 &&
+            (current_time - c->last_cmd_time) > settings.idle_timeout) {
+        if (c->state != conn_new_cmd && c->state != conn_read) {
+            if (settings.verbose > 1)
+                fprintf(stderr, "fd %d wants to timeout, but isn't in read state",
+                    c->sfd);
+            return;
+        }
+
+        if (settings.verbose > 1)
+            fprintf(stderr, "Closing idle fd %d\n", c->sfd);
+
+        c->thread->stats.idle_kicks++;
+
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+    }
+}
+
+/* bring conn back from a sidethread. could have had its event base moved. */
+void conn_worker_readd(conn *c) {
+    c->ev_flags = EV_READ | EV_PERSIST;
+    event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
+    event_base_set(c->thread->base, &c->event);
+    c->state = conn_new_cmd;
+
+    // TODO: call conn_cleanup/fiail/etc
+    if (event_add(&c->event, 0) == -1) {
+        perror("event_add");
+    }
+#ifdef EXTSTORE
+    // If we had IO objects, process
+    if (c->io_wraplist) {
+        // assert(c->io_wraplist == 0); // assert no more to process
+        conn_set_state(c, conn_mwrite);
+        drive_machine(c);
+    }
+#endif
+}
+
 conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
@@ -291,6 +332,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     return c;
 }
+
+
 
 static int start_conn_timeout_thread() {
     int ret;
