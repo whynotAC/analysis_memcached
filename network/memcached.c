@@ -141,6 +141,47 @@ static void *conn_timeout_thread(void *arg) {
     return NULL;
 }
 
+void conn_close_idle(conn *c) {
+    if (setting.idle_timeout > 0 &&
+            (current_time - c->last_cmd_time) > settings.idle_timeout) {
+        if (c->state != conn_new_cmd && c->state != conn_read) {
+            if (settings.verbose > 1)
+                fprintf(stderr, "fd %d wants to timeout, but isn't in read state",
+                    c->sfd);
+            return;
+        }
+
+        if (settings.verbose > 1)
+            fprintf(stderr, "Closing idle fd %d\n", c->sfd);
+
+        c->thread->stats.idle_kicks++;
+
+        conn_set_state(c, conn_closing);
+        drive_machine(c);
+    }
+}
+
+/* bring conn back from a sidethread. could have had its event base moved. */
+void conn_worker_readd(conn *c) {
+    c->ev_flags = EV_READ | EV_PERSIST;
+    event_set(&c->event, c->sfd, c->ev_flags, event_handler, (void *)c);
+    event_base_set(c->thread->base, &c->event);
+    c->state = conn_new_cmd;
+
+    // TODO: call conn_cleanup/fiail/etc
+    if (event_add(&c->event, 0) == -1) {
+        perror("event_add");
+    }
+#ifdef EXTSTORE
+    // If we had IO objects, process
+    if (c->io_wraplist) {
+        // assert(c->io_wraplist == 0); // assert no more to process
+        conn_set_state(c, conn_mwrite);
+        drive_machine(c);
+    }
+#endif
+}
+
 conn *conn_new(const int sfd, enum conn_states init_state,
                 const int event_flags,
                 const int read_buffer_size, enum network_transport transport,
@@ -290,6 +331,220 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     MEMCACHED_CONN_ALLOCATE(c->sfd);
 
     return c;
+}
+
+static void conn_release_items(conn *c) {
+    assert(c != NULL);
+
+    if (c->item) {
+        item_remove(c->item);
+        c->item = 0;
+    }
+
+    while (c->ileft > 0) {
+        item *it = *(c->icurr);
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+        item_remove(it);
+        c->icurr++;
+        c->ileft--;
+    }
+
+    if (c->suffixleft != 0) {
+        for (; c->suffixleft > 0; c->suffixleft--, c->suffixcurr++) {
+            do_cache_free(c->thread->suffix_cache, *(c->suffixcurr));
+        }
+    }
+#ifdef EXTSTORE
+    if (c->io_wraplist) {
+        io_wrap *tmp = c->io_wraplist;
+        while (tmp) {
+            io_wrap *next = tmp->next;
+            recache_or_free(c, tmp);
+            do_cache_free(c->thread->io_cache, tmp); // lockless
+            tmp = next;
+        }
+        c->io_wraplist = NULL;
+    }
+#endif
+    c->icurr = c->ilist;
+    c->suffixcurr = c->suffixlist;
+}
+
+static void conn_cleanup(conn *c) {
+    assert(c != NULL);
+
+    conn_release_items(c);
+
+    if (c->write_and_free) {
+        free(c->write_and_free);
+        c->write_and_free = 0;
+    }
+
+    if (c->sasl_conn) {
+        assert(settings.sasl);
+        sasl_dipose(&c->sasl_conn);
+        c->sasl_conn = NULL;
+    }
+
+    if (IS_UDP(c->transport)) {
+        conn_set_state(c, conn_read);
+    }
+}
+
+/**
+ * Frees a connection
+ */
+void conn_free(conn *c) {
+    if (c) {
+        assert(c != NULL);
+        assert(c->sfd >= 0 && c->sfd < max_fds);
+
+        MEMCACHED_CONN_DESTROY(c);
+        conns[c->sfd] = NULL;
+        if (c->hdrbuf)
+            free(c->hdrbuf);
+        if (c->msglist)
+            free(c->msglist);
+        if (c->rbuf)
+            free(c->rbuf);
+        if (c->wbuf)
+            free(c->wbuf);
+        if (c->ilist)
+            free(c->ilist);
+        if (c->suffixlist)
+            free(c->suffixlist);
+        if (c->iov)
+            free(c->iov);
+        free(c);
+    }
+}
+
+static void conn_close(conn *c) {
+    assert(c != NULL);
+
+    // delete the event, the socket and the conn
+    event_del(&c->event);
+
+    if (settings.verbose > 1)
+        fprintf(stderr, "<%d connection closed.\n", c->sfd);
+    
+    conn_cleanup(c);
+
+    MEMCACHED_CONN_RELEASE(c->sfd);
+    conn_set_state(c, conn_closed);
+    close(c->sfd);
+
+    pthread_mutex_lock(&conn_lock);
+    allow_new_conns = true;
+    pthread_mutex_unlock(&conn_lock);
+
+    STATS_LOCK();
+    stats_state.curr_conns--;
+    STATS_UNLOCK();
+
+    return;
+}
+
+/*
+ * Shrinks a connection's buffers if they're too big. This prevents
+ * periodic large "get" requests from permanently chewing lots of server
+ * memory.
+ *
+ * This should only be called in between requests since it can wipe output
+ * buffers!
+ */
+static void conn_shrink(conn *c) {
+    assert(c != NULL);
+
+    if (IS_UDP(c->transport))
+        return;
+
+    if (c->rsize > READ_BUFFER_HIGHWAT && c->rbytes < DATA_BUFFER_SIZE) {
+        char *newbuf;
+
+        if (c->rcurr != c->rbuf)
+            memmove(c->rbuf, c->rcurr, (size_t)c->rbytes);
+
+        newbuf = (char *)realloc((void *)c->rbuf, DATA_BUFFER_SIZE);
+
+        if (newbuf) {
+            c->rbuf = newbuf;
+            c->rsize = DATA_BUFFER_SIZE;
+        }
+        // TODO check other branch...
+        c->rcurr = c->rbuf;
+    }
+
+    if (c->isize > ITEM_LIST_HIGHWAT) {
+        item **newbuf = (item**) realloc((void *)c->ilist, 
+                    ITEM_LIST_INITIAL * sizeof(c->ilist[0]));
+        if (newbuf) {
+            c->ilist = newbuf;
+            c->isize = ITEM_LIST_INITIAL;
+        }
+        // TODO check error condition?
+    }
+
+    if (c->msgsize > MSG_LIST_HIGHWAT) {
+        struct msghdr *newbuf = (struct msghdr *) realloc((void *)c->msglist, 
+                MSG_LIST_INITIAL * sizeof(c->msglist[0]));
+        if (newbuf) {
+            c->msglist = newbuf;
+            c->msgsize = MSG_LIST_INITIAL;
+        }
+        // TODO check error condition?
+    }
+    if (c->iovsize > IOV_LIST_HIGHWAT) {
+        struct iovec *newbuf = (struct iovec *) realloc((void *)c->iov, 
+                IOV_LIST_INITIAL * sizeof(c->iov[0]));
+        if (newbuf) {
+            c->iov = newbuf;
+            c->iovsize = IOV_LIST_INITIAL;
+        }
+        // TODO check return value
+    }
+}
+
+/**
+ * Convert a state name to a human readable form.
+ */
+static const char *state_text(enum conn_states state) {
+    const char* const statenames[] = { "conn_listening",
+                                       "conn_new_cmd",
+                                       "conn_waiting",
+                                       "conn_read",
+                                       "conn_parse_cmd",
+                                       "conn_write",
+                                       "conn_nread",
+                                       "conn_swallow",
+                                       "conn_closing",
+                                       "conn_mwrite",
+                                       "conn_closed",
+                                       "conn_watch" };
+    return statenames[state];
+}
+
+/**
+ * Sets a connection's current state in the state machine. Any special
+ * processing that needs to happedn on certain state transitions can
+ * happend here.
+ */
+static void conn_set_state(conn *c, enum conn_states state) {
+    assert(c != NULL);
+    assert(state >= conn_listening && state < conn_max_state);
+
+    if (state != c->state) {
+        if (settings.verbose > 2) {
+            fprintf(stderr, "%d: going from %s to %s\n",
+                        c->sfd, state_text(c->state),
+                        state_text(state));
+        }
+
+        if (state == conn_write || state == conn_mwrite) {
+            MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
+        }
+        c->state = state;
+    }
 }
 
 static int start_conn_timeout_thread() {
