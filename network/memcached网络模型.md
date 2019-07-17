@@ -10,7 +10,7 @@ memcached网络模型
 6. `memcached`的定时器
 7. 总结
 
-## 使用的结构体以及全局变量
+## 1. 使用的结构体以及全局变量
 本小节将详细介绍一下`memcached`使用的网络相关的结构体，并介绍它们成员的作用。
 
 ```
@@ -246,3 +246,7 @@ static pthread_mutex_t cqi_freelist_lock; // 访问空闲CQ_ITEM链表的互斥�
 static LIBEVENT_THREAD *threads;
 
 ```
+上面代码部分列出了将要使用的所有全局变量以及其对应的定义，后面将介绍这些变量是如何在`memcached`程序中使用的。
+
+## 2. `main thread`的事件以及处理器
+
