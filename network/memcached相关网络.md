@@ -4,7 +4,8 @@ memcached网络相关函数
 主要分为两个部分:
 
 1. `memcached`主线程中网络设置过程。
-2. `memcached`调用`libevent`的函数。
+2. `memcached`子线程中网络设置过程。
+3. `memcached`调用`libevent`的函数。
 
 ## 1. `memcached`主线程中网络设置 
 主函数中关于网络部分的代码如下所示:
@@ -839,7 +840,68 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 ```
 通过`conn_new`的代码可知，将传递过来的套接字以及初始化状态，关心事件传递过来，将其包装成`conn`结构体，然后加入到对应线程的`Reactor`管理器中，设置事件的处理函数。
 
-## 2. `memcached`调用`libevent`的函数
+## 2. `memcached`子线程中网络设置过程
+前面介绍了`memcached`主线程的网络设置，本小节将介绍`memcached`的网络子线程相关的设置操作。其源代码如下所示:
+
+```
+// 在thread.c文件中memcached_thread_init函数
+void memcached_thread_init(int nthreads, void *arg) {
+	// 其他代码
+	···
+	
+	// 网络相关设置代码
+	for (i = 0; i < nthreads; i++) {
+		int fds[2];
+		if (pipe(fds)) {
+			perror("Can't create notify pipe");
+			exit(1);
+		}
+		
+		threads[i].notify_receive_fd = fds[0];
+		threads[i].notify_send_fd = fds[1];
+#ifdef EXTSTORE
+		threads[i].storage = arg;
+#endif
+		// 网络相关设置
+		setup_thread(&threads[i]);
+		/* Reserve three fds for the libevent base, and two for the pipe */
+		stats_state.reserved_fds += 5;
+	}
+	
+	// 其他代码
+	···
+}
+
+// thread.c文件中setup_thread函数
+/*
+ * Set up a thread's information
+ */
+static void setup_thread(LIBEVENT_THREAD *me) {
+#if defined(LIBEVENT_VERSION_NUMBER) && LIBEVENT_VERSION_NUMBER >= 0x02000101
+	struct event_config *ev_config;
+	ev_config = event_config_new();
+	event_config_set_flag(ev_config, EVENT_BASE_FLAG_NOLOCK);
+	me->base = event_base_new_with_config(ev_config);
+	event_config_free(ev_config);
+#else
+	me->base = event_init();
+#endif
+
+	// 其他代码
+	···
+	
+	/* Listen for notifications from other threads */
+	event_set(&me->notify_event, me->notify_receive_fd,
+				EV_READ | EV_PERSIST, thread_libevent_process, me);
+	event_base_set(me->base, &me->notify_event);
+	
+	// 其他代码
+	···
+} 
+```
+通过上述代码可知，网络子线程监听`notify_receive_fd`通道的读端，监听事件为`EV_READ|EV_PERSIST`，处理事件的函数为`thread_libevent_process`。
+
+## 3. `memcached`调用`libevent`的函数
 `memcached`中使用`libevent`中的`Reactor`管理器以及事件分发函数来管理多个网络套接字，其使用的`libevent`的函数如下:
 
 |  函数名   |  定义   | 作用   | 备注 |

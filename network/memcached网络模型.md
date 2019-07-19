@@ -249,4 +249,6 @@ static LIBEVENT_THREAD *threads;
 上面代码部分列出了将要使用的所有全局变量以及其对应的定义，后面将介绍这些变量是如何在`memcached`程序中使用的。
 
 ## 2. `main thread`的事件以及处理器
+`main thread`网络设置过程如下图所示:
 
+![main thread网络设置流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/network/主线程网络设置流程图.png)
