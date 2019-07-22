@@ -252,3 +252,290 @@ static LIBEVENT_THREAD *threads;
 `main thread`网络设置过程如下图所示:
 
 ![main thread网络设置流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/network/主线程网络设置流程图.png)
+
+| 网络通信方式 |  `conn`结构体的`state` | 监听事件 | 处理事件函数  | 绑定的线程
+| ---------- | --------------------- | ------- | ----------- | ------- |
+| `linux socket` | `conn_listening` | `EV_READ|EV_PERSIST` | `event_handler` | 绑定到主线程`main_base`的`Reactor`事件管理器中 |
+| `tcp socket` | `conn_listening` | `EV_READ|EV_PERSIST` | `event_handler` | 绑定到主线程`main_base`的`Reactor`事件管理器中 |
+| `udp socket` | `conn_read` | `EV_READ|EV_PERSIST` | `event_handler` | 绑定到通信网络子线程的`Reactor`事件管理器中 |
+
+事件处理器`event_handler`源代码如下:
+
+```
+// memcached.c文件中event_handler函数
+// 参数解释:
+/* fd -- 绑定的网络通信描述符
+ * which -- 关注事件的类型
+ * arg -- 自己注册的conn结构体的指针
+ */
+void event_handler(const int fd, const short which, void *arg) {
+	conn *c;
+	
+	c = (conn *)arg;
+	assert(c != NULL);
+	
+	c->which = which;
+	
+	/* sanity */
+	if (fd != c->sfd) {
+		if (settings.verbose > 0)
+			fprintf(stderr, "Catastrophic: event fd doesn't match conn fd!\n");
+		conn_close(c);
+		return;
+	}
+	
+	drive_machine(c);		// 进入状态机进行信息处理
+	
+	/* wait for next event */
+	return;
+}
+
+// 状态机的程序代码
+static void drive_machine(conn *c) {
+	bool stop = false;
+	int sfd;
+	socklen_t addrlen;
+	struct sockaddr_storage addr;
+	int nreqs = settings.reqs_per_event;
+	int res;
+	const char *str;
+#ifdef HAVE_ACCEPT4
+	static int use_accept4 = 1;
+#else
+	static int use_accept4 = 0;
+#endif
+	
+	assert(c != NULL);
+	
+	while (!stop) {
+		
+		switch(c->state) {
+		case conn_listening:		// 主线程监听的事件
+			addrlen = sizeof(addr);
+#ifdef HAVE_ACCEPT4
+			if (use_accept4) {
+				sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+			} else {
+				sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+			}
+#else
+			sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+#endif
+			if (sfd == -1) {
+				// 判断是否accept成功
+				if (use_accept4 && errno == ENOSYS) {
+					use_accept4 = 0;
+					continue;
+				}
+				perror(use_accept4 ? "accept4()" : "accept()");
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					/* these are transient, so don't log anything */
+					stop = true;
+				} else if (errno == EMFILE) {
+					// 判断是否是系统没有空闲的文件描述符了，不能接受更多的connection链接
+					if (settings.verbose > 0)
+						fprintf(stderr, "Too many open connections\n");
+					accept_new_conns(false); // 表示程序不接受新的connection链接
+					stop = true;
+				} else {
+					perror("accept()");
+					stop = true;
+				}
+				break;
+			}
+			if (!use_accept4) {
+				// 设置新链接的套接字为非阻塞套接字
+				if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
+					perror("setting O_NONBLOCK");
+					close(sfd);
+					break;
+				}
+			}
+			// 判断是否超过了程序设置的最大链接数
+			if (settings.maxconns_fast &&
+					stats_state.curr_conns + stats_state.reserved_fds >= settings.maxconns - 1) {
+				str = "ERROR Too many open connection\r\n";				res = write(sfd, str, strlen(str));
+				close(sfd);
+				STATS_LOCK();
+				stats.rejected_conns++;
+				STATS_UNLOCK();
+			} else {
+				// 接收到的connection链接，分配到网络通信子线程中
+				dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST,
+					DATA_BUFFER_SIZE, c->transport);
+			}
+			
+			stop = true;
+			break;
+		case xxx:
+			// 其他状态代码
+		
+		case conn_read:	
+			res = IS_UDP(c->transport) ? try_read_udp(c) : try_read_network(c);
+			
+			switch (res) {
+			case READ_NO_DATA_RECEIVED:
+				conn_set_state(c, conn_waiting);
+				break;
+			case READ_DATA_RECEIVED:
+				conn_set_state(c, conn_parse_cmd);
+				break;
+			case READ_ERROR:
+				conn_set_state(c, conn_closing);				break;
+			case READ_MEMORY_ERROR: // Failed to allocate more memory
+				/* State already set by try_read_network */
+				break;
+			}
+			break;
+			
+		case xxx:
+			// 其他状态代码
+		}
+	}
+}
+```
+由此可以发现当主线程中`linux socket`和`tcp`方式的都只会调用`drive_machine`中的`conn_listening`分支，用来接受新的`conneciton`链接，然后将`connection`链接分配到网络子线程中。新`connection`的注册事件以及`connection`状态如下所示:
+
+|  `conn`结构体的`state` | 监听事件 | 处理事件函数  | 绑定的线程 |
+| --------------------- | ------- | ----------- | ------- |
+| `conn_new_cmd` | `EV_READ|EV_PERSIST` | `event_handler` | 绑定到网络通信线程的`Reactor`事件管理器中 |
+
+对于主线程使用的是`udp`通信方式时会调用`driver_machine`中的`conn_read`分支，然后根据读取套接字的数据状态来进行不同的处理方式。
+
+## 3. `sub thread`的事件以及处理器
+前面介绍了主线程的网络设置，下面将讲述网络通信子线程的事件设置以及对应的事件处理器,其图示如下:
+
+![sub thread网络设置流程图示](https://github.com/whynotAC/analysis_memcached/blob/master/network/网络子线程网络设置流程图.jpg)
+
+| 通信端口 | 监听事件 | 处理事件函数 | 绑定的线程 |
+| `pipe`函数创建的通道的读端 | `EV_READ | EV_PERSIST` | `thread_libevent_process` | 绑定到网络通信子线程的`Reactor`事件管理器中 |
+
+事件处理器的函数代码如下:
+
+```
+/* 
+ * Processes an incoming "handle a new connection" item. This is called when
+ * input arrives on the libevent wakeup pipe.
+ */
+static void thread_libevent_process(int fd, short which, void *arg) {
+	LIBEVENT_THREAD *me = arg;
+	CQ_ITEM *item;
+	char buf[1];
+	conn *c;
+	unsigned int timeout_fd;
+	// 读取发送过来的命令
+	if (read(fd, buf, 1) != 1) {
+		if (settings.verbose > 0)
+			fprintf(stderr, "Can't read from libevent pipe\n");
+		return;
+	}
+	
+	// 根据发送过来的命令来进行处理
+	switch (buf[0]) {
+	case 'c':			// 创建新的connection
+		item = cq_pop(me->new_conn_queue);
+		
+		if (NULL == item) {
+			break;
+		}
+		switch (item->mode) {
+			case queue_new_conn:   // 新链接
+				// 将新来的connection连接到Reactor管理器上。
+				// init_state为 conn_new_cmd
+				// event_flags为 EV_READ | EV_PERSIST
+				// 处理函数为 event_handler
+				c = conn_new(item->sfd, item->init_state, item->event_flags,
+									item->read_buffer_size, item->transport,
+									me->base);
+				if (c == NULL) {
+					if (IS_UDP(item->transport)) {
+						fprintf(stderr, "Can't listen for events on UDP socket\n");
+						exit(1);
+					} else {
+						if (settings.verbose > 0) {
+							fprintf(stderr, "Can't listen for events on fd %d\n",
+								item->sfd);
+						}
+						close(item->sfd);
+					}
+				} else {
+					c->thread = me;
+				}
+				break;
+			
+			case queue_redispatch:	// 重新绑定connection
+				conn_worker_readd(item->c);
+				break;
+		}
+		cqi_free(item);
+		break;
+	/* we were told to pause and report in */
+	case 'p':		// 网络子线程初始化完成
+		register_thread_initialized();
+		break;
+	/* a client socket timed out */
+	case 't':		// connection超时处理
+		if (read(fd, &timeout_fd, sizeof(timeout_fd)) != sizeof(timeout_fd)) {
+			if (settings.verbose > 0)
+				fprintf(stderr, "Can't read timeout fd from libevent pipe\n");
+			return;
+		}
+		conn_close_idle(conns[timeout_fd]);
+		break;
+	}
+}
+```
+由上述代码可以看出网络通信子线程中事件处理器，处理三种命令`c`、`p`、`t`。它们分别对应新链接的到来，通信子线程的初始化完成、`connection`的超时处理。
+
+## 4. `connection`的生命周期
+前面介绍了主线程和网络子线程的网络设置，由源代码可以看出主线程中进行监听，接收网络链接后，通过调用`dispatch_conn_new`函数，将新的`connection`分配到网络通信子线程的`Reactor`管理器上，从而开启了`connection`的生命周期。
+
+![connection生命周期图示](https://github.com/whynotAC/analysis_memcached/blob/master/network/connection的生命周期.png)
+
+下面将从四个方面对`connection`的生命周期进行介绍:
+
+1. 新`connection`的处理操作。
+2. `connection`的主动退出。
+3. `connection`的超时退出。
+4. `connection`是否允许接收判断。
+
+对于新`connection`接收的相关代码前面已经介绍过很多次，这里不再进行介绍了。其他几个方面将进行逐一介绍。
+
+### `connection`的主动退出
+当网络通信结束时，网络子线程会调用`drive_machine`函数中的`case conn_closing`分支进行处理，其源代码如下:
+
+```
+// drive_machine函数中
+case conn_closing:
+	if (IS_UDP(c->transport))
+		conn_cleanup(c);
+	else
+		conn_close(c);
+	stop = true;
+	break;
+
+// 对于UDP的套接字进行的处理conn_cleanup函数
+static void conn_cleanup(conn *c) {
+	assert(c != NULL);
+	
+	conn_release_items(c);	// 清空conn链接的item
+	
+	if (c->write_and_free) {		// 清空写出缓存空间
+		free(c->write_and_free);
+		c->write_and_free = 0;
+	}
+	
+	if (c->sasl_conn) {				// 清空认证信息
+		assert(settings.sasl);
+		sasl_dispose(&c->sasl_conn);
+		c->sasl_conn = NULL;
+	}
+	
+	if (IS_UDP(c->transport)) {		// 重新设置主线程中的UDP状态
+		conn_set_state(c, conn_read);
+	}
+}
+
+// 对于TCP的套接字进行的处理conn_close函数
+
+```
