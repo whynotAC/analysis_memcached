@@ -537,5 +537,117 @@ static void conn_cleanup(conn *c) {
 }
 
 // 对于TCP的套接字进行的处理conn_close函数
+static void conn_close(conn *c) {
+	assert(c != NULL);
+	
+	/* delete the event, the socket and the conn */
+	event_del(&c->event);		// 从Reactor管理器中去除监听套接字
+	
+	if (settings.verbose > 1)
+		fprintf(stderr, "<%d connection closed.\n", c->sfd);
+	
+	conn_cleanup(c); 	// 去除conn结构体中的item
+	
+	MEMCACHED_CONN_RELEASE(c->sfd);
+	conn_set_state(c, conn_closed);	// 设置conn的状态
+	close(c->sfd);		// 关闭套接字
+	
+	pthread_mutex_lock(&conn_lock);
+	allow_new_conns = true;				// 允许接收新connection请求
+	pthread_mutex_unlock(&conn_lock);
+	
+	STATS_LOCK();
+	stats_state.curr_conns--;
+	STATS_UNLOCK();
+	
+	return;
+}
+```
+通过源代码可以看出，`connection`主动退出对于TCP和UDP采用不同的处理方式，基本上都是清除`conn`结构体中的`item`链表，清除发送缓冲区等操作。TCP方式中还设置了`conn`为关闭状态，从`Reactor`管理器中取消`sfd`的事件监控套接字。
 
+### `connection`的超时退出
+`memcached`中主线程会启动回话超时检查线程`conn_timeout_thread`，此线程会逐一检查`conns`指向的`struct conn`数组中的每一个`conn`，根据`conn`的最近执行`cmd`的时间来判断`conn`是否出现超时情况。
+
+线程启动源代码如下:
+
+```
+// memcached.c文件中main函数
+if (settigs.idle_timeout && start_conn_timeout_thread() == -1) {
+	exit(EXIT_FAILURE);
+}
+
+// 创建检查回话超期线程
+static int start_conn_timeout_thread() {
+	int ret;
+	
+	if (settings.idle_timeout == 0)
+		return -1;
+	
+	if ((ret = pthread_create(&conn_timeout_tid, NULL,
+			conn_timeout_thread, NULL)) != 0) {
+		fprintf(stderr, "Can't create idle connection timeout thread: %s\n", strerror(ret));
+		return -1;
+	}
+	
+	return 0;
+}
+
+// 回话检测线程
+#define CONNS_PER_SLICE 100
+#define TIMEOUT_MSG_SIZE (1 + sizeof(int))
+static void *conn_timeout_thread(void *arg) {
+	int i;
+	conn *c;
+	char buf[TIMEOUT_MSG_SIZE];
+	rel_time_t oldest_last_cmd;
+	int sleep_time;
+	useconds_t timeslice = 1000000 / (max_fds / CONNS_PER_SLICE);
+	
+	while (1) {
+		if (settings.verbose > 2)
+			fprintf(stderr, "idle timeout thread at top of connection list\n");
+		
+		oldest_last_cmd = current_time;
+		
+		// 依次循环判断conn是否超时
+		for (i = 0; i < max_fds; i++) {
+			if ((i % CONNS_PER_SLICE) == 0) {
+				if (settings.verbose > 2)
+					fprintf(stderr, "idle timeout thread sleeping for %ulus\n",
+								(unsinged int)timeslice);
+				usleep(timeslice);
+			}
+			
+			// 判断struct conn是否申请了空间
+			if (!conns[i])
+				continue;
+			
+			c = conns[i];		// 获取对应的struct conn结构体
+			
+			// 判断是否是TCP端口
+			if (!IS_TCP(c->transport))
+				continue;
+			
+			// 如果struct conn的状态不为conn_new_cmd或者conn_read时，则不进行超时判断
+			if (c->state != conn_new_cmd && c->state != conn_read)
+				continue;
+			
+			// 根据struct conn结构体中最后执行cmd的时间来判断是否超时
+			if ((current_time - c->last_cmd_time) > settings.idle_timeout) {
+				// conn超时，则向其网络通信线程发送超时命令
+				buf[0] = 't';					// 命令
+				memcpy(&buf[1], &i, sizeof(int)); // 超时conn对应的下标
+				// 发送命令
+				if (write(c->thread->notify_send_fd, buf, TIMEOUT_MSG_SIZE) != TIMEOUT_MSG_SIZE)
+					perror("Failed to write timeout to notify pipe");
+			} else {
+				// 最近超时的时间
+				if (c->last_cmd_time < oldest_last_cmd)
+					oldest_last_cmd = c->last_cmd_time;
+			}
+		}
+		
+		/* This*/
+	}
+}
 ```
