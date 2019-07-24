@@ -647,7 +647,201 @@ static void *conn_timeout_thread(void *arg) {
 			}
 		}
 		
-		/* This*/
+		/* This is the soonest we could have another connection time out */
+		sleep_time = settings.idle_timeout - (current_time - oldest_last_cmd) + 1;
+		if (sleep_time <= 0)
+			sleep_time = 1;
+			
+		if (settings.verbose > 2)
+			fprintf(stderr,
+						"idle timeout thread finished pass, sleepting for %ds\n",
+						sleep_time);
+		usleep((useconds_t) sleep_time * 1000000);
+	}
+	
+	return NULL;
+}
+
+// 网络子线程处理pipe通道读端的事件
+/*
+ * Processes an incoming "handle a new connection" item. This is called when
+ * input arrives on the libevent wakeup pipe.
+ */
+static void thread_libevent_process(int fd, short which, void *arg) {
+	LIBEVENT_THREAD *me = arg;
+	CQ_ITEM *item;
+	char buf[1];
+	conn *c;
+	unsigned int timeout_fd;
+	
+	// 读取命令字符
+	if (read(fd, buf, 1) != 1) {
+		if (settings.verbose > 0)
+			fprintf(stderr, "Can't read from libevent pipe\n");
+		return;
+	}
+	
+	// 根据命令来进行执行
+	switch(buf[0]) {
+	// 其他命令
+	
+	// a client socket timed out
+	case 't':
+		// 读取回话超期的文件描述符
+		if (read(fd, &timeout_fd, sizeof(timeout_fd)) != sizeof(timeout_fd)) {
+			if (settings.verbose > 0)
+				fprintf(stderr, "Can't read timeout fd from libevent pipe\n");
+			return;
+		}
+		//
+		conn_close_idle(conns[timeout_fd]);
+		break;
 	}
 }
+
+// memcached.c文件中的conn_close_idle函数
+void conn_close_idle(conn *c) {
+	if (settings.idle_timeout > 0 &&
+			(current_time - c->last_cmd_time) > settings.idle_timeout) {
+		if (c->state != conn_new_cmd && c->state != conn_read) {
+			if (settings.verbose > 1)
+				fprintf(stderr, "fd %d wants to timeout, but isn't in read state", c->sfd);
+			return;
+		}
+		
+		if (settings.verbose > 1)
+			fprintf(stderr, "Closing idle fd %d\n", c->sfd);
+		
+		c->thread->stats.idle_kicks++;
+		
+		// 设置conn的状态,走主动关闭的路径
+		conn_set_state(c, conn_closing);
+		drive_machine(c);
+	}
+}
+```
+通过上述的源代码可知，检查超时线程依次检查`struct conn`结构体，根据`last_cmd_time`来判断其是否超时。如果发现超时的`conn`结构体，则将向对应的网络通信线程的`Reactor`管理器中的`pipe`管道读文件描述符发送`t`命令。网络通信线程中调用回调函数`thread_libevent_process`来处理超时命令，将`conn`的状态置为`conn_closing`，然后走主动退出的路线。
+
+### `connection`是否允许接收判断
+`memcached`程序中当有过多的链接时，将会拒绝`connection`链接，等待`connection`的数量少于阀值`settings.maxconns`时，会继续接收新的链接请求。其源代码如下:
+
+```
+static void drive_machine(conn *c) {
+	// 其他代码
+	
+	while (!stop) {
+		
+		switch(c->state) {
+		case conn_listening:
+			// 其他代码
+			
+			// 判断是否超过阀值
+			if (settings.maxconns_fast &&
+					stats_state.curr_conns + stats_state.reserved_fds >= settings.maxconns - 1) {
+				str = "ERROR Too many open connections\r\n";
+				res = write(sfd, str, strlen(str));
+				close(sfd);
+				STATS_LOCK();
+				stats.rejected_conns++;
+				STATS_UNLOCK();
+			} else {
+				// 接收新的connection链接请求
+				dispatch_conn_new(sfd, conn_new_cmd, EV_READ | EV_PERSIST, DATA_BUFFER_SIZE, c->transport);
+			}
+			
+		···
+		}
+	}
+}
+```
+当线程没有文件描述符可以分配的情况时，主线程将会注册时间定时器来监控是否有可以分配的文件描述符可用。其源代码如下:
+
+```
+// 判断是否有文件描述符可用
+static void drive_machine(conn *c) {
+	// 其他代码
+	
+	while (!stop) {
+		
+		switch(c->state) {
+		case conn_listening:
+			addrlen = sizeof(addr);
+#ifdef HAVE_ACCEPT4
+			if (use_accept4) {
+				sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+			} else {
+				sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+			}
+#else
+			sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+#endif
+			// 判断是否accept失败
+			if (sfd == -1) {
+				if (use_accept4 && errno = ENOSYS) {
+					use_accept4 = 0;
+					continue;
+				}	
+				perror(use_accept4 ? "accept4()" : "accept()");
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					/* these are transient, so don't log anything */
+					stop = true;
+				} else if (errno == EMFILE) {
+					// 当没有空余的文件描述符时操作
+					if (settings.verbose > 0)
+						fprintf(stderr, "Too many open connections\n");
+					/*******************重点函数*****************/
+					accept_new_conns(false); // 不允许接收新的connection
+					/*******************重点函数*****************/
+					stop = true;
+				} else {
+					perror("accept()");
+					stop = true;
+				}
+				break;
+			}
+			
+		···
+		}
+	}
+}
+
+/*
+ * Sets whether or not we accept new connections
+ */
+void accept_new_conns(const bool do_accept) {
+	pthread_mutex_lock(&conn_lock);
+	do_accept_new_conns(do_accept);
+	pthread_mutex_unlock(&conn_lock);
+}
+
+/*
+ * Sets whether we are listening for new connections or not.
+ * do_accept: true,允许接收新connection;false,不允许接收新connection。
+ */
+void do_accept_new_conns(const bool do_accept) {
+	conn *next;
+	
+	for (next = listen_conn; next; next = next->next) {
+		if (do_accept) {
+			update_event(next, EV_READ | EV_PERSIST); // 更新`Reactor`管理器中监听事件
+			// 开启监听队列
+			if (listen(next->sfd, settings.backlog) != 0) {
+				perror("listen");
+			}
+		} else {
+			update_event(next, 0);		// 不注册`Reactor`管理器中的监听事件
+			// 监听队列长度为0
+			if (liten(next->sfd, 0) != 0) {
+				perror("listen");
+			}
+		}
+	}
+	
+	if (do_accept) {
+		struct timeval 
+	} else {
+		// 
+	}
+}
+
 ```
