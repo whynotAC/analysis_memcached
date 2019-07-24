@@ -838,10 +838,183 @@ void do_accept_new_conns(const bool do_accept) {
 	}
 	
 	if (do_accept) {
-		struct timeval 
+		struct timeval maxconns_exited;
+		uint64_t elapsed_us;
+		gettimeofday(&maxconns_exited, NULL);
+		STATS_LOCK();
+		elapsed_us = (maxconns_exited.tv_sec - stats.maxconns_entered.tc_sec) * 1000000 + (maxconns_exited.tv_usec - stats.maxconns_entered.tv_usec);
+		stats.time_in_listen_disabled_us += elapsed_us;
+		stats_state.accepting_conns = true;
+		STATS_UNLOCK();
 	} else {
-		// 
+		// 不允许接收新的请求
+		STATS_LOCK();
+		stats_state.accepting_conns = false;
+		gettimeofday(&stats.maxconns_entered,NULL);
+		stats.liten_disabled_num++;
+		STATS_UNLOCK();
+		allow_new_conns = false;
+		// 设置定时器，检查是否可以接受新的链接
+		maxconns_handler(-42, 0, 0);
 	}
 }
 
+/* This reduces the latency without adding lots of extra wiring to be able to
+ * notify the listener thread of when to listen again.
+ * Also, the clock timer could be broken out into its own thread and we
+ * can block the listener via a condition.
+ */
+static volatile bool allow_new_conns = true;
+static struct event maxconnsevent;
+static void maxconns_handler(const int fd, const short which, void *arg) {
+	struct timeval t = {.tv_sec = 0, .tv_usec = 10000};
+	
+	if (fd == -42 || allow_new_conns == false) {
+		// 判断是否可以接受新的链接
+		/* reshedule in 10ms if we need to keep polling */
+		evtimer_set(&maxconnsevent, maxconns_handler, 0); // 设置定时器
+		event_base_set(main_base, &maxconnsevent); // 将定时器绑定到Reactor管理器中
+		evtimer_add(&maxconnsevent, &t);
+	} else {
+		// 删除定时器
+		evtimer_del(&maxconnsevent);
+		accept_new_conns(true);			// 允许接收新的链接
+	}
+}
 ```
+上面代码中详细描述了是否有可用的文件描述符判断，以及如何设置定时器来监控文件描述符可用状态。下面显示是怎样判断是否有可用的文件描述符。
+
+```
+// 关闭conn结构时，文件描述符空闲出来
+static void conn_close(conn *c) {
+	assert (c != NULL);
+	
+	/* delete the event, the socket and the conn */
+	event_del(&c->event);
+	
+	if (settings.verbose > 1)
+		fprintf(stderr, "<%d connection closed.\n", c->sfd);
+	
+	conn_cleanup(c);
+	
+	MEMCACHED_CONN_RELEASE(c->sfd);
+	conn_set_state(c, conn_closed);
+	close(c->sfd);	// 关闭文件描述符
+	
+	pthread_mutex_lock(&conn_lock);
+	allow_new_conns = true;		// 有可用得文件描述符
+	pthread_mutex_unlock(&conn_lock);
+	
+	STATS_LOCK();
+	stats_state.curr_conns--;
+	STATS_UNLOCK();
+	
+	return;
+}
+```
+
+## 5. `memcached`网络模型
+根据前面[网络模型](https://github.com/whynotAC/analysis_memcached/blob/master/network/%E7%BD%91%E7%BB%9C%E6%A8%A1%E5%9E%8B.md)的那篇文章介绍多种网络模型，本小节将介绍`memcached`中的网络模型。其图示如下:
+
+![memcached网络通信模型图示](https://github.com/whynotAC/analysis_memcached/blob/master/network/memcached网络通信模型.png)
+
+通过上图可以看出，`memcached`网络模型中有多个`Reactor`管理器，每个网络通信子线程负责自己`Reactor`管理器上的文件描述符以及其对应的事件处理，主线程负责维护自己的`Reactor`管理器，将新来的`connection`链接分配给网络通信子线程去处理。
+
+## 6. `memcached`的定时器
+`memcached`中的定时器主要负责`current_time`时间的更新，使得其他线程能够使用此变量来判进行后续的处理(例如: `lru`超时检查线程来检测`item`是否超期)。其定时器代码如下:
+
+```
+// memcached.c文件中main函数
+int main (int argc, char **argv) {
+	···
+	
+	/* initialise clock event */
+	clock_handler(0, 0, 0);  // 设置定时器
+	
+	···
+}
+
+/*
+ * We keep the current time of day in a global variable that's updated by a
+ * timer event. This saves us a bunch of time() system calls (we really only
+ * need to get the time once a second, whereas there can be tens of thousands
+ * of requests a second) and allows us to use server-start-relative timestamps
+ * rather than absolute UNIX timestamps, a space savings on systems where
+ * sizeof(time_t) > sizeof(unsigned int).
+ */
+volatile rel_time_t current_time;
+static struct event clockevent;
+
+time_t prcess_started; // when the process was started
+
+/* libevent uses a monotonic clock when available for event scheduling. Aside
+ * from jitter, simply ticking our internal timer here is accurate enough.
+ * Note that users who are setting explicit dates for expiration times *must*
+ * ensure their clocks are correct before starting memcached. */
+static void clock_handler(const int fd, const short which, void *arg) {
+	struct timeval t = {.tv_sec = 1, .tv_usec = 0};
+	static bool initialized = false;
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+	static bool monotonic = false;
+	static time_t monotonic_start;
+#endif
+   
+   // 判断是否初始化过
+   if (initialized) {
+   		/* only delete the events if it's actually there. */
+   		evtimer_del(&clockevent);	// 删除定时器事件
+   } else {
+   		initialized = true;
+   		/* process_started is initialized to time() - 2. We initialize to 1 so flush_all won't underflow during tests */
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+		struct timespec ts;
+		if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+			monotonic = true;
+			monotonic_start = ts.tv_sec - ITEM_UPDATE_INTERVAL - 2;
+		}
+#endif
+   }
+   
+   // While we're here, check for hash table expansion.
+   // This function should be quick to avoid delaying the timer
+   assoc_start_expand(stats_state.curr_items);  // 判断是否需要扩展hash链表
+   
+   // 设置定时器以及其处理器
+   evtimer_set(&clockevent, clock_handler, 0);
+   event_base_set(main_base, &clockevent);
+   evtimer_add(&clockevent, &t); // 每级秒定时器
+   
+   // 修改current_time时间
+#if defined(HAVE_CLOCK_GETTIME) && defined(CLOCK_MONOTONIC)
+	if (monotonic) {
+		struct timespec ts;
+		if (clock_gettime(CLOCK_MONOTONIC, &ts) == -1)
+			return;
+		current_time = (rel_time_t) (ts.tv_sec - monotonic_start);
+		return;
+	}
+#endif
+	{
+		struct timeval tv;
+		gettimeofday(&tv, NULL);
+		current_time = (rel_time_t)(tv.tv_sec - process_started);
+	}
+}
+
+// process_started值设置
+static void stats_init(void) {
+	···
+	
+	/* make the time we started always be 2 seconds before we really
+	 * did, so time(0) - time.started is never zero. if so, things
+	 * like 'settings.oldest_live' which act as booleans as well as
+	 * values are now false in boolean context...
+	 */
+	process_started = time(0) - ITEM_UPDATE_INTERVAL - 2;
+	···
+}
+```
+通过上述代码可以看出，`memcached`程序通过`Reactor`管理器中的定时器来实现对`current_time`的秒级更新。
+
+## 7. 总结
+本文详细介绍了`memcached`中的网络通信模型，以及`connection`的生命周期。主要涉及了`libevent`的相关部分，以及网络通信子线程的通信事件处理。后续文章将详细介绍网络通信子线程中文件描述符的处理流程。
