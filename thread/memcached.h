@@ -432,7 +432,146 @@ static void drive_machine(conn *c) {
 
         case conn_swallow:
             /* we are reading sbytes and throwing them away */
+            if (c->sbytes <= 0) {
+                conn_set_state(c, conn_new_cmd);
+                break;
+            }
 
+            /* first check if we have leftovers in the conn_read buffer */
+            if (c->rbytes > 0) {
+                int tocopy = c->rbytes > c->sbytes ? c->sbytes : c->rbytes;
+                c->sbytes -= tocopy;
+                c->rcurr += tocopy;
+                c->rbytes -= tocopy;
+                break;
+            }
+
+            /* now try reading from the socket */
+            res = read(c->sfd, c->rbuf, c->rsize > c->sbytes ? c->sbytes : c->rsize);
+            if (res > 0) {
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                c->thread->stats.bytes_read += res;
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+                c->sbytes -= res;
+                break;
+            }
+            if (res == 0) {
+                conn_set_state(c, conn_closing);
+                break;
+            }
+            if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (!update_event(c, EV_READ | EV_PERSIST)) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Couldn't update event\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
+                stop = true;
+                break;
+            }
+            /* otherwise we have a real error, on which we close the connection */
+            if (settings.verbose > 0)
+                fprintf(stderr, "Failed to read, and not due to blocking\n");
+            conn_set_state(c, conn_closing);
+            break;
+
+        case conn_write:
+            /*
+             * We want to write out a simple response. If we haven't already,
+             * assemble it into a msgbuf list (this will be a single-entry
+             * list for TCP or a two-entry list for UDP).
+             */
+            if (c->iovused == 0 || (IS_UDP(c->transport) && c->iovused == 1)) {
+                if (add_iov(c, c->wcurr, c->wbytes) != 0) {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Couldn't build response\n");
+                    conn_set_state(c, conn_closing);
+                    break;
+                }
+            }
+
+            /* fail through... */
+
+        case conn_mwrite:
+#ifdef EXTSTORE
+            /* have side IO's that must process before transmit() can run.
+             * remove the connection from the worker thread and dispatch the 
+             * IO queue.
+             */
+            if (c->io_wrapleft) {
+                assert(c->io_queued == false);
+                assert(c->io_wraplist != NULL);
+                // TODO: create proper state for this condition
+                conn_set_state(c, conn_watch);
+                event_del(&c->event);
+                c->io_queued = true;
+                extstore_submit(c->thread->storage, &c->io_wraplist->io);
+                stop = true;
+                break;
+            }
+#endif
+            if (IS_UDP(c->transport) && c->msgcurr == 0 && build_udp_headers(c) != 0) {
+                if (settings.verbose > 0) {
+                    fprintf(stderr, "Failed to build UDP headers\n");
+                }
+                conn_set_state(c, conn_closing);
+                break;
+            }
+            switch (trasmit(c)) {
+            case TRANSMIT_COMPLETE:
+                if (c->state == conn_mwrite) {
+                    conn_release_items(c);
+                    /* XXX: I don't know why this wasn't the general case */
+                    if (c->protocol == binary_prot) {
+                        conn_set_state(c, c->write_and_go);
+                    } else {
+                        conn_set_state(c, conn_new_cmd);
+                    }
+                } else if (c->state == conn_write) {
+                    if (c->write_and_free) {
+                        free(c->write_and_free);
+                        c->write_and_free = 0;
+                    }
+                    conn_set_state(c, c->write_and_go);
+                } else {
+                    if (settings.verbose > 0)
+                        fprintf(stderr, "Unexpected state %d\n", c->state);
+                    conn_set_state(c, conn_closing);
+                }
+                break;
+
+            case TRANSMIT_INCOMPLETE:
+            case TRANSMIT_HEAD_ERROR:
+                break;          // Continue in state machine
+
+            case TRANSMIT_SOFT_ERROR:
+                stop = true;
+                break;
+            }
+            break;
+
+        case conn_closing:
+            if (IS_UDP(c->transport))
+                conn_cleanup(c);
+            else
+                conn_close(c);
+            stop = true;
+            break;
+
+        case conn_closed:
+            /* This only happens if dormando is an idot. */
+            abort();
+            break;
+
+        case conn_watch:
+            /* We handed off our connection to the logger thread. */
+            stop = true;
+            break;
+        case conn_max_state:
+            assert(false);
+            break;
         }
     }
+
+    return;
 }
