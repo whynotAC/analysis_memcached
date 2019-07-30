@@ -39,6 +39,58 @@ static pthread_mutex_t init_lock;
 static pthread_cond_t init_cond;
 
 /*
+ * Sets whether or not we accept new connections.
+ */
+void accept_new_conns(const bool do_accept) {
+    pthread_mutex_lock(&conn_lock);
+    do_accept_new_conns(do_accept);
+    pthread_mutex_unlock(&conn_lock);
+}
+
+/* which thread we assigned a connection to most recently */
+static int last_thread = -1;
+
+/**
+ * Dispatches a new connection to another thread. This is only ever called
+ * from the main thread, either during initialization (for UDP) or because
+ * of an incoming connection.
+ */
+void dispatch_conn_new(int sfd, enum conn_states init_state, int event_flags,
+                        int read_buffer_size, enum network_transport transport) {
+    CQ_ITEM *item = cqi_new();
+    char buf[1];
+    if (item == NULL) {
+        close(sfd);
+        /* given that malloc failed this may also fail, but let's try*/
+        fprintf(stderr, "Failed to allocate memory for connection object\n");
+        return ;
+    }
+
+    int tid = (last_thread + 1) % settings.num_threads;
+
+    LIBEVENT_THREAD *thread = threads + tid;
+
+    last_thread = tid;
+
+    item->sfd = sfd;
+    item->init_state = init_state;
+    item->event_flags = event_flags;
+    item->read_buffer_size = read_buffer_size;
+    item->transport = transport;
+    item->mode = queue_new_conn;
+
+    cq_push(thread->new_conn_queue, item);
+
+    MEMCACHED_CONN_DISPATCH(sfd, thread->thread_id);
+    buf[0] = 'c';
+    if (write(thread->notify_send_fd, buf, 1) != 1) {
+        perror("Writing to thread notify pipe");
+    }
+}
+
+
+
+/*
  * Initializes the thread subsystem, creating various worker threads.
  *
  * nthreads Number of worker event handler threads to spawn
