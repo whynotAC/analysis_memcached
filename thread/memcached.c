@@ -41,6 +41,250 @@ static void maxconns_handler(const int fd, const short which, void *arg) {
 }
 
 /*
+ * Adds a message header to a connection.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
+ */
+static int add_msghdr(conn *c)
+{
+    struct msghdr *msg;
+
+    assert(c != NULL);
+
+    if (c->msgsize == c->msgused) {
+        msg = realloc(c->msglist, c->msgsize * 2 * sizeof(struct msghdr));
+        if (! msg) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return -1;
+        }
+        c->msglist = msg;
+        c->msgsize *= 2;
+    }
+
+    msg = c->msglist + c->msgused;
+
+    /* this wipes msg_iovlen, msg_control, msg_controllen, and
+     * msg_flags, the last 3 of which aren't defined on solaris: */
+    memset(msg, 0, sizeof(struct msghdr));
+
+    msg->msg_iov = &c->iov[c->iovused];
+
+    if (IS_UDP(c->transport) && c->request_addr_size > 0) {
+        msg->msg_name = &c->request_addr;
+        msg->msg_namelen = c->request_addr_size;
+    }
+
+    c->msgbytes = 0;
+    c->msgused++;
+
+    if (IS_UDP(c->transport)) {
+        /* Leave room for the UDP header, which we'll fill in later. */
+        return add_iov(c, NULL, UDP_HEADER_SIZE);
+    }
+
+    return 0;
+}
+
+/*
+ * Adds data to the list of pending data that will be written out to a
+ * connection.
+ *
+ * Return 0 on success, -1 on out-of-memory.
+ * Note: This is a hot path for at least ASCII protocol. While there is
+ * redundant code in spliting TCP/UDP handing, any reduction in steps has a
+ * large impact for TCP connections.
+ */
+static int add_iov(conn *c, const void *buf, int len) {
+    struct msghdr *m;
+    int leftover;
+
+    assert(c != NULL);
+
+    if (IS_UDP(c->transport)) {
+        do {
+            m = &c->msglist[c->msgused - 1];
+
+            /*
+             * limit UDP packets to UDP_MAX_PAYLOAD_SIZE bytes.
+             */
+
+            /* We may need to start a new msghdr if this one is full. */
+            if (m->msg_iovlen == IOV_MAX ||
+                    (c->msgbytes >= UDP_MAX_PAYLOAD_SIZE)) {
+                add_msghdr(c);
+                m = &c->msglist[c->msgused - 1];
+            }
+
+            if (ensure_iov_space(c) != 0)
+                return -1;
+
+            /* If the fragment is too big to fit in the datagram, split it up */
+            if (len + c->msgbytes > UDP_MAX_PAYLOAD_SIZE) {
+                leftover = len + c->msgbytes - UDP_MAX_PAYLOAD_SIZE;
+                len -= leftover;
+            } else {
+                leftover = 0;
+            }
+
+            m = &c->msglist[c->msgused - 1];
+        }
+    }
+}
+
+static const char *prot_text(enum protocol prot) {
+    char *rv = "unknown";
+    switch (prot) {
+        case ascii_prot:
+            rv = "ascii";
+            break;
+        case binary_prot:
+            rv = "binary";
+            break;
+        case negotiating_prot:
+            rv = "auto-negotiate";
+            break;
+    }
+    return rv;
+}
+
+/*
+ * if we have a complete line in the buffer, process it.
+ */
+static int try_read_command(conn *c) {
+    assert(c != NULL);
+    assert(c->rcurr <= (c->rbuf + c->rsize));
+    assert(c->rbytes > 0);
+
+    if (c->protocol == negotiating_prot || c->transport == udp_transport) {
+        if ((unsigned char)c->rbuf[0] == (unsigned char)PORTOCOL_BINARY_REQ) {
+            c->protocol = binary_prot;
+        } else {
+            c->protocol = ascii_prot;
+        }
+
+        if (settings.verbose > 1) {
+            fprintf(stderr, "%d: Client using the %s protocol\n", c->sfd,
+                    prot_text(c->protocol));
+        }
+    }
+
+    if (c->protocol == binary_prot) {
+        /* Do we have the complete packet header? */
+        if (c->rbytes < sizeof(c->binary_header)) {
+            /* need more data! */
+            return 0;
+        } else {
+#ifdef NEED_ALIGN
+            if (((long)(c->rcurr)) % 8 != 0) {
+                /* must realign input buffer */
+                memmove(c->rbuf, c->rcurr, c->rbytes);
+                c->rcurr = c->rbuf;
+                if (settings.verbose > 1) {
+                    fprintf(stderr, "%d: Realign input buffer\n", c->sfd);
+                }
+            }
+#endif
+            protocol_binary_request_header* req;
+            req = (protocol_binary_request_header*)c->rcurr;
+
+            if (settings.verbose > 1) {
+                /* Dump the packet before we convert it to host order */
+                int ii;
+                fprintf(stderr, "<%d Read binary protocol data:", c->sfd);
+                for (ii = 0; ii < sizeof(req->bytes); ++ii) {
+                    if (ii % 4 == 0) {
+                        fprintf(stderr, "\n<%d  ", c->sfd);
+                    }
+                    fprintf(stderr, " 0x%02x", req->bytes[ii]);
+                }
+                fprintf(stderr, "\n");
+            }
+
+            c->binary_header = *req;
+            c->binary_header.request.keylen = ntohs(req->request.keylen);
+            c->binary_header.request.bodylen = ntohl(req->request.bodylen);
+            c->binary_header.request.cas = ntohll(req->request.cas);
+
+            if (c->binary_header.request.magic != PROTOCOL_BINARY_REQ) {
+                if (settings.verbose) {
+                    fprintf(stderr, "Invalid magic: %x\n",
+                            c->binary_header.request.magic);
+                }
+                conn_set_state(c, conn_closing);
+                return -1;
+            }
+
+            c->msgcurr = 0;
+            c->msgused = 0;
+            c->iovused = 0;
+            if (add_msghdr(c) != 0) {
+                out_of_memory(c, 
+                    "SERVER_ERROR Out of memory allocating headers");
+                return 0;
+            }
+
+            c->cmd = c->binary_header.request.opcode;
+            c->keylen = c->binary_header.request.keylen;
+            c->opaque = c->binary_header.request.opaque;
+            /* clear the returned cas value */
+            c->cas = 0;
+
+            dispatch_bin_command(c);
+
+            c->rbytes -= sizeof(c->binary_header);
+            c->rcurr += sizeof(c->binary_header);
+        }
+    } else {
+        char *el, *cont;
+
+        if (c->rbytes == 0)
+            return 0;
+
+        el = memchr(c->rcurr, '\n', c->rbytes);
+        if (!el) {
+            if (c->rbytes > 1024) {
+                /*
+                 * We didn't have a '\n' in the first k. This _has_ to be a
+                 * large multiget, if not we should just nuke the connection.
+                 */
+                char *ptr = c->rcurr;
+                while (*ptr == ' ') { /* ignore leading whitespaces */
+                    ++ptr;
+                }
+
+                if (ptr - c->rcurr > 100 ||
+                        (strncmp(ptr, "get ", 4) && strncmp(str, "gets ", 5))) {
+                    
+                    conn_set_state(c, conn_closing);
+                    return 1;
+                }
+            }
+
+            return 0;
+        }
+        cont = el + 1;
+        if ((el - c->rcurr) > 1 && *(el - 1) == '\r') {
+            el--;
+        }
+        *el = '\0';
+
+        assert(cont <= (c->rcurr + c->rbytes));
+
+        c->last_cmd_time = current_time;
+        process_command(c, c->rcurr);
+
+        c->rbytes -= (cont - c->rcurr);
+        c->rcurr = cont;
+
+        assert(c->rcurr <= (c->rbuf + c->rsize));
+    }
+
+    return 1;
+}
+
+/*
  * read a UDP request.
  */
 static enum try_read_result try_read_udp(conn *c) {
