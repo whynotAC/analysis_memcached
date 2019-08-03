@@ -129,8 +129,35 @@ static int add_iov(conn *c, const void *buf, int len) {
             }
 
             m = &c->msglist[c->msgused - 1];
+            m->msg_iov[m->msg_iolen].iov_base = (void *)buf;
+            m->msg_iov[m->msg_iovlen].iov_len = len;
+
+            c->msgbytes += len;
+            c->iovused++;
+            m->msg_iovlen++;
+
+            buf = ((char *)buf) + len;
+            len = leftover;
+        } while (leftover > 0);
+    } else {
+        /* Optimized path for TCP connections */
+        m = &c->msglist[c->msgused - 1];
+        if (m->msg_iovlen == IOV_MAX) {
+            add_msghdr(c);
+            m = &c->msglist[c->msgused - 1];
         }
+
+        if (ensure_iov_space(c) != 0)
+            return -1;
+
+        m->msg_iov[m->msg_iovlen].iov_base = (void *)buf;
+        m->msg_iov[m->msg_iovlen].iov_len = len;
+        c->msgbytes += len;
+        c->iovused++;
+        m->msg_iovlen++;
     }
+
+    return 0;
 }
 
 static const char *prot_text(enum protocol prot) {
@@ -147,6 +174,435 @@ static const char *prot_text(enum protocol prot) {
             break;
     }
     return rv;
+}
+
+static void add_bin_header(conn *c, uint16_t err, uint8_t hdr_len, uint16_t key_len, uint32_t body_len) {
+    protocol_binary_response_header* header;
+
+    assert(c);
+
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    if (add_msghdr(c) != 0) {
+        /* This should never run out of memory because iov and msg lists
+         * have minimum sizes big enough to hold an error response.
+         */
+        out_of_memory(c, "SERVER_ERROR out of memory adding binary header");
+        return;
+    }
+
+    header = (protocol_binary_response_header *)c->wbuf;
+
+    header->response.magic = (uint8_t)PROTOCOL_BINARY_RES;
+    header->response.opcode = c->binary_header.request.opcode;
+    header->response.keylen = (uint16_t)htons(key_len);
+
+    header->response.extlen = (uint8_t)hdr_len;
+    header->response.datatype = (uint8_t)PROTOCOL_BINARY_RAW_BYTES;
+    header->response.status = (uint16_t)htons(err);
+
+    header->response.bodylen = htonl(body_len);
+    header->response.opaque = c->opaque;
+    header->response.cas = htonll(c->cas);
+
+    if (settings.verbose > 1) {
+        int ii;
+        fprintf(stderr, ">%d Writing bin response:", c->sfd);
+        for (ii = 0; ii < sizeof(header->bytes); ++ii) {
+            if (ii % 4 == 0) {
+                fprintf(stderr, "\n>%d  ", c->sfd);
+            }
+            fprintf(stderr, " 0x%02x", header->bytes[ii]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    add_iov(c, c->wbuf, sizeof(header->response));
+}
+
+/**
+ * Writes a binary error response. If errstr is supplied, it is used as the 
+ * error text; otherwise a generic description of the error status code is
+ * included.
+ */
+static void write_bin_error(conn *c, protocol_binary_response_status err,
+                                const char *errstr, int swallow) {
+    size_t len;
+
+    if (!errstr) {
+        switch (err) {
+        case PROTOCOL_BINARY_RESPONSE_ENOMEM:
+            errstr = "Out of memory";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND:
+            errstr = "Unknown command";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_KEY_ENOENT:
+            errstr = "Not found";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_EINVAL:
+            errstr = "Invalid arguments";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS:
+            errstr = "Data exists for key. ";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_E2BIG:
+            errstr = "Too large.";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_DELTA_BADVAL:
+            errstr = "Non-numeric server-side value for incr or decr";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_NOT_STORED:
+            errstr = "Not stored.";
+            break;
+        case PROTOCOL_BINARY_RESPONSE_AUTH_ERROR:
+            errstr = "Auth failure.";
+            break;
+        default:
+            assert(false);
+            errstr = "UNHANDLED ERROR";
+            fprintf(stderr, ">%d UNHANDLED ERROR: %d\n", c->sfd, err);
+        }
+    }
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, ">%d Writing an error: %s\n", c->sfd, errstr);
+    }
+
+    len = strlen(errstr);
+    add_bin_header(c, err, 0, 0, len);
+    if (len > 0) {
+        add_iov(c, errstr, len);
+    }
+    conn_set_state(c, conn_mwrite);
+    if (swalow > 0) {
+        c->sbytes = swallow;
+        c->write_and_go = conn_swallow;
+    } else {
+        c->write_and_go = conn_new_cmd;
+    }
+}
+
+/* From and send a response to a command over the binary protocol */
+static void write_bin_response(conn *c, void *d, int hlen, int keylen, int dlen) {
+    if (!c->noreply || c->cmd == PROTOCOL_BINARY_CMD_GET ||
+            c->cmd == PROTOCOL_BINARY_CMD_GETK) {
+        add_bin_header(c, 0, hlen, keylen, dlen);
+        if (dlen > 0) {
+            add_iov(c, d, dlen);
+        }
+        conn_set_state(c, conn_mwrite);
+        c->write_and_go = conn_new_cmd;
+    } else {
+        conn_set_state(c, conn_new_cmd);
+    }
+}
+
+/* Just write an error message and disconnect the client */
+static void handle_binary_protocol_error(conn *c) {
+    write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, 0);
+    if (settings.verbose) {
+        fprintf(stderr, "Protocol error (opcode %02x), close connection %d\n",
+                    c->binary_header.request.opcode, c->sfd);
+    }
+    c->write_and_go = conn_closing;
+}
+
+static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
+    assert(c);
+    c->substate = next_substate;
+    c->rlbytes = c->keylen + extra;
+
+    /* OK... do we have room for the extras and the key in the input buffer?*/
+    ptrdiff_t offset = c->rcurr + sizeof(protocol_binary_request_header) - c->rbuf;
+    if (c->rlbytes > c->rsize - offset) {
+        size_t nsize = c->rsize;
+        size_t size = c->rlbytes + sizeof(protocol_binary_request_header);
+
+        while (size > nsize) {
+            nsize *= 2;
+        }
+
+        if (nsize != c->rsize) {
+            if (settings.verbose > 1) {
+                fprintf(stderr, "%d: Need to grow buffer from %lu to %lu\n",
+                    c->sfd, (unsigned long)c->rsize, (unsigned long)nsize);
+            }
+            char *newm = realloc(c->rbuf, nsize);
+            if (newm == NULL) {
+                STATS_LOCK();
+                stats.malloc_fails++;
+                STATS_UNLOCK();
+                if (settings.verbose) {
+                    fprintf(stderr, "%d: Failed to grow buffer.. closing connection\n",
+                                c->sfd);
+                }
+                conn_set_state(c, conn_closing);
+                return;
+            }
+
+            c->rbuf = newm;
+            /* rcurr should point to the same offset in the packet */
+            c->rcurr = c->rbuf + offset - sizeof(protocol_binary_request_header);
+            c->rsize = nsize;
+        }
+        if (c->rbuf != c->rcurr) {
+            memmove(c->rbuf, c->rcurr, c->rbytes);
+            c->rcurr = c->rbuf;
+            if (settings.verbose > 1) {
+                fprintf(stderr, "%d: Repack input buffer\n", c->sfd);
+            }
+        }
+    }
+
+    /* preserve the header in the buffer */
+    c->ritem = c->rcurr + sizeof(protocol_binary_request_header);
+    conn_set_state(c, conn_nread);
+}
+
+static void init_sasl_conn(conn *c) {
+    assert(c);
+    /* should something else be returned? */
+    if (!settings.sasl)
+        return;
+
+    c->authenticated = false;
+
+    if (!c->sasl_conn) {
+        int result = sasl_server_new("memcached",
+                            NULL,
+                            my_sasl_hostname[0] ? my_sasl_hostname : NULL,
+                            NULL, NULL,
+                            NULL, 0, &c->sasl_conn);
+        if (result != SASL_OK) {
+            if (settings.verbose) {
+                fprintf(stderr, "Failed to initialize SASL conn.\n");
+            }
+            c->sasl_conn = NULL;
+        }
+    }
+}
+
+static void bin_list_sasl_mechs(conn *c) {
+    // Guard against a disabled SASL.
+    if (!settings.sasl) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND, NULL,
+                            c->binary_header.request.bodylen - 
+                            c->binary_header.request.keylen);
+        return;
+    }
+
+    init_sasl_conn(c);
+    const char *result_string = NULL;
+    unsigned int string_length = 0;
+    int result = sasl_listmech(c->sasl_conn, NULL,
+                                "",
+                                " ",
+                                "",
+                                &result_string, &string_length,
+                                NULL);
+    if (result != SASL_OK) {
+        /* Perhaps there's a better error for this... */
+        if (settings.verbose) {
+            fprintf(stderr, "Failed to list SASL mechanisms.\n");
+        }
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
+        return;
+    }
+    write_bin_response(c, (char *)result_string, 0, 0, string_length);
+}
+
+static void dispatch_bin_command(conn *c) {
+    int protocol_error = 0;
+
+    uint8_t extlen = c->binary_header.request.extlen;
+    uint16_t keylen = c->binary_header.request.keylen;
+    uint32_t bodylen = c->binary_header.request.bodylen;
+
+    if (keylen > bodylen || keylen + extlen > bodylen) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND, NULL, 0);
+        c->write_and_go = conn_closing;
+        return;
+    }
+
+    if (settings.sasl && !authenticated(c)) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
+        c->wirte_and_go = conn_closing;
+        return;
+    }
+
+    MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
+    c->noreply = true;
+
+    /* binport supports 16bit keys, but internals are still 8bit */
+    if (keylen > KEY_MAX_LENGTH) {
+        handle_binary_protocol_error(c);
+        return;
+    }
+
+    switch (c->cmd) {
+    case PROTOCOL_BINARY_CMD_SETQ:
+        c->cmd = PROTOCOL_BINARY_CMD_SET;
+        break;
+    case PROTOCOL_BINARY_CMD_ADDQ:
+        c->cmd = PROTOCOL_BINARY_CMD_ADD;
+        break;
+    case PROTOCOL_BINARY_CMD_REPLACEQ:
+        c->cmd = PROTOCOL_BINARY_CMD_REPLACE;
+        break;
+    case PROTOCOL_BINARY_CMD_DELETEQ:
+        c->cmd = PROTOCOL_BINARY_CMD_DELETE;
+        break;
+    case PROTOCOL_BINARY_CMD_INCREMENTQ:
+        c->cmd = PROTOCOL_BINARY_CMD_INCREMENT;
+        break;
+    case PROTOCOL_BINARY_CMD_DECREMENTQ:
+        c->cmd = PROTOCOL_BINARY_CMD_DECREMENT;
+        break;
+    case PROTOCOL_BINARY_CMD_QUITQ:
+        c->cmd = PROTOCOL_BINARY_CMD_QUIT;
+        break;;
+    case PROTOCOL_BINARY_CMD_FLUSHQ:
+        c->cmd = PROTOCOL_BINARY_CMD_FLUSH;
+        break;
+    case PROTOCOL_BINARY_CMD_APPENDQ:
+        c->cmd = PROTOCOL_BINARY_CMD_APPEND;
+        break;
+    case PROTOCOL_BINARY_CMD_PREPENDQ:
+        c->cmd = PROTOCOL_BINARY_CMD_PREPEND;
+        break;
+    case PROTOCOL_BINARY_CMD_GETQ:
+        c->cmd = PROTOCOL_BINARY_CMD_GET;
+        break;
+    case PROTOCOL_BINARY_CMD_GETKQ:
+        c->cmd = PROTOCOL_BINARY_CMD_GETK;
+        break;
+    case PROTOCOL_BINARY_CMD_GATQ:
+        c->cmd = PROTOCOL_BINARY_CMD_GAT;
+        break;
+    case PROTOCOL_BINARY_CMD_GATKQ:
+        c->cmd = PROTOCOL_BINARY_CMD_GATK;
+        break;
+    default:
+        c->noreply = false;
+    }
+    
+    switch (c->cmd) {
+    case PROTOCOL_BINARY_CMD_VERSION:
+        if (extlen == 0 && keylen == 0 && bodylen == 0) {
+            write_bin_response(c, VERSION, 0, 0, strlen(VERSION));
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_FLUSH:
+        if (keylen == 0 && bodylen == extlen && (extlen == 0 || extlen == 4)) {
+            bin_read_key(c, bin_read_flush_exptime, extlen);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_NOOP:
+        if (extlen == 0 && keylen == 0 && bodylen == 0) {
+            write_bin_response(c, NULL, 0, 0, 0);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_SET:       // FALLTHROUGH
+    case PROTOCOL_BINARY_CMD_ADD:       // FALLTHROUGH
+    case PROTOCOL_BINARY_CMD_REPLACE:
+        if (extlen == 0 && keylen != 0 && bodylen >= (keylen + 8)) {
+            bin_read_key(c, bin_reading_set_header, 8);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_GETQ:
+    case PROTOCOL_BINARY_CMD_GET:
+    case PROTOCOL_BINARY_CMD_GETKQ:
+    case PROTOCOL_BINARY_CMD_GETK:
+        if (extlen == 0 && bodylen == keylen && keylen > 0) {
+            bin_read_key(c, bin_reading_get_key, 0);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_DELETE:
+        if (keylen > 0 && extlen == 0 && bodylen == keylen) {
+            bin_read_key(c, bin_reading_del_header, extlen);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_INCREMENT:
+    case PROTOCOL_BINARY_CMD_DECREMENT:
+        if (keylen > 0 && extlen == 20 && bodylen == (keylen + extlen)) {
+            bin_read_key(c, bin_reading_incr_header, 20);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_APPEND:
+    case PROTOCOL_BINARY_CMD_PREPEND:
+        if (keylen > 0 && extlen == 0) {
+            bin_read_key(c, bin_reading_set_header, 0);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_STAT:
+        if (extlen == 0) {
+            bin_read_key(c, bin_reading_stat, 0);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_QUIT:
+        if (keylen == 0 && extlen == 0 && bodylen == 0) {
+            write_bin_response(c, NULL, 0, 0, 0);
+            c->write_and_go = conn_closing;
+            if (c->noreply) {
+                conn_set_state(c, conn_closing);
+            }
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_SASL_LIST_MECHS:
+        if (extlen == 0 && keylen == 0 && bodylen == 0) {
+            bin_list_sasl_mechs(c);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_SASL_AUTH:
+    case PROTOCOL_BINARY_CMD_SASL_STEP:
+        if (extlen == 0 && keylen != 0) {
+            bin_read_key(c, bin_reading_sasl_auth, 0);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    case PROTOCOL_BINARY_CMD_TOUCH:
+    case PROTOCOL_BINARY_CMD_GAT:
+    case PROTOCOL_BINARY_CMD_GATQ:
+    case PROTOCOL_BINARY_CMD_GATK:
+    case PROTOCOL_BINARY_CMD_GATKQ:
+        if (extlen == 4 && keylen != 0) {
+            bin_read_key(c, bin_reading_touch_key, 4);
+        } else {
+            protocol_error = 1;
+        }
+        break;
+    default:
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND, NULL,
+                            bodylen);
+    }
+
+    if (protocol_error)
+        handle_binary_protocol_error(c);
 }
 
 /*
@@ -282,6 +738,317 @@ static int try_read_command(conn *c) {
     }
 
     return 1;
+}
+
+static void process_command(conn *c, char *command) {
+    token_t tokens[MAX_TOKENS];
+    size_t ntokens;
+    int comm;
+
+    assert(c != NULL);
+
+    MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
+
+    if (settings.verbose > 1)
+        fprintf(stderr, "<%d %s\n", c->sfd, command);
+
+    /*
+     * for commands set/add/replace, we build an item and read the data
+     * directyle into it, then continue in nread_complete().
+     */
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    if (add_msghdr(c) != 0) {
+        out_of_memory(c, "SERVER_ERROR out of memory preparing response");
+        return;
+    }
+
+    ntokens = tokenize_command(comand, tokens, MAX_TOKENS);
+    if (ntokens >= 3 && 
+            ((strcmp(tokens[COMMAND_TOKEN].value, "get") == 0) ||
+             (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0))) {
+        
+        process_get_command(c, tokens, ntokens, false, false);
+
+    } else if ((ntokens == 6 || ntokens == 7) && 
+                ((strcmp(tokens[COMMAND_TOKEN].value, "add") == 0 && (comm = NREAD_ADD)) ||
+                 (strcmp(tokens[COMMAND_TOKEN].value, "set") == 0 && (comm = NREAD_SET)) ||
+                 (strcmp(tokens[COMMAND_TOKEN].value, "replace") == 0 && (comm = NREAD_REPLACE)) ||
+                 (strcmp(tokens[COMMAND_TOKEN].value, "prepend") == 0 && (comm = NREAD_PREPEND)) ||
+                 (strcmp(tokens[COMMAND_TOKEN].value, "append") == 0 && (comm = NREAD_APPEND)) )) {
+        
+        process_update_command(c, tokens, ntokens, comm, false);
+    
+    } else if ((ntokens == 7 || ntokens == 8) && (strcmp(tokens[COMMAND_TOKEN].value, "cas") == 0 && (comm = NREAD_CAS))) {
+        
+        process_update_command(c, tokens, ntokens, comm, true);
+
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "incr") == 0)) {
+    
+        process_arithmetic_command(c, tokens, ntokens, 1);
+
+    } else if (ntokens >=3 && (strcmp(tokens[COMMAND_TOKEN].value, "gets") == 0)) {
+        
+        process_get_command(c, tokens, ntokens, 1);
+
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "decr") == 0)) {
+        
+        process_arithmetic_command(c, tokens, ntokens, 0);
+        
+    } else if (ntokens >= 3 && ntokens <= 5 && (strcmp(tokens[COMMAND_TOKEN].value, "delete") == 0)) {
+    
+        process_delete_command(c, tokens, ntokens);
+
+    } else if ((ntokens == 4 || ntokens == 5) && (strcmp(tokens[COMMAND_TOKEN].value, "touch") == 0)) {
+        
+        process_touch_command(c, tokens, ntokens);
+        
+    } else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gat") == 0)) {
+    
+        process_get_command(c, tokens, ntokens, false, true);
+    
+    } else if (ntokens >= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "gats") == 0)) {
+    
+        process_get_command(c, tokens, ntokens, true, true);
+    
+    } else if (ntokens >= 2 && (strcmp(tokens[COMMAND_TOKEN].value, "stats") == 0)) {
+        
+        process_stat(c, tokens, ntokens);
+
+    } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
+        time_t exptime = 0;
+        rel_time_t new_oldest = 0;
+
+        set_noreply_maybe(c, tokens, ntokens);
+
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.flush_cmds++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        if (!settings.flush_enabled) {
+            // flush_all is not allowed but we log it on stats
+            out_string(c, "CLIENT_ERROR flush_all not allowed");
+            return;
+        }
+
+        if (ntokens != (c->noreply ? 3 : 2)) {
+            exptime = strtol(tokens[1].value, NULL, 10);
+            if (errno == ERANGE) {
+                out_string(c, "CLIENT_ERROR bad command lien format");
+                return;
+            }
+        }
+
+        /*
+         * if exptime is zero realtime() would return zero too, and
+         * realtime(exptime) - 1 would overflow to the max unsigned
+         * value. So we process exptime == 0 the same way we do when
+         * no delay is given at all.
+         */
+        if (exptime > 0) {
+            new_oldest = realtime(exptime);
+        } else {    // exptime == 0
+            new_oldest = current_time;
+        }
+
+        if (settings.use_cas) {
+            settings.oldest_live = new_oldest - 1;
+            if (settings.oldest_live <= current_time)
+                settings.oldest_cas = get_cas_id();
+        } else {
+            settings.oldest_live = new_oldest;
+        }
+        out_string(c, "OK");
+        return;
+    
+    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "version") == 0)) {
+        
+        out_string(c, "VERSION " VERSION);
+
+    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0)) {
+    
+      conn_set_state(c, conn_closing);
+    
+    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "shutdown") == 0)) {
+    
+        if (settings.shutdown_command) {
+            conn_set_state(c, conn_closing);
+            raise(SIGINT);
+        } else {
+            out_string(c, "ERROR: shutdown not enabled");
+        }
+    
+    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "slabs") == 0) {
+        if (ntokens == 5 && strcmp(tokens[COMMAND_TOKEN + 1].value, "reassign") == 0) {
+            int src, dst, rv;
+
+            if (settings.slab_reassign == false) {
+                out_string(c, "CLIENT_ERROR slab reassignment disabled");
+                return;
+            }
+
+            src = strtol(tokens[2].value, NULL, 10);
+            dst = strtol(tokens[3].value, NULL, 10);
+
+            if (errno == ERANGE) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+
+            rv = slabs_reassign(src, dst);
+            switch (rv) {
+            case REASSIGN_OK:
+                out_string(c, "OK");
+                break;
+            case REASSIGN_RUNNING:
+                out_string(c, "BUSY currently processing reassign request");
+                break;
+            case REASSIGN_BADCLASS:
+                out_string(c, "BADCLASS invalid src or dst class id");
+                break;
+            case REASSIGN_NOSPARE:
+                out_string(c, "NOSPARE source class has no spare pages");
+                break;
+            case REASSIGN_SRC_DST_SAME:
+                out_string(c, "SAME src and dst class are identica");
+                break;
+            }
+            return;
+        } else if (ntokens >= 4 && 
+                (strcmp(tokens[COMMAND_TOKEN + 1].value, "automove") == 0)) {
+            prcess_slabs_automove_command(c, tokens, ntokens);
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "lru_crawler") == 0) {
+        if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "crawl") == 0) {
+            int rv;
+            if (settings.lru_crawler == false) {
+                out_string(c, "CLIENT_ERROR lru crawler disabled");
+                return;
+            }
+
+            rv = lru_crawler_crawl(tokens[2].value, CRAWLER_EXPIRED, NULL, 0,
+                        settings.lru_crawler_tocrawl);
+            switch (rv) {
+            case CRAWLER_OK:
+                out_string(c, "OK");
+                break;
+            case CRAWLER_RUNNING:
+                out_string(c, "BUSY currently processing crawler request");
+                break;
+            case CRAWLER_BADCLASS:
+                out_string(c, "BADCLASS invalid class id");
+                break;
+            case CRAWLER_NOTSTARTED:
+                out_string(c, "NOTSTARTED no items to crawl");
+                break;
+            case CRAWLER_ERROR:
+                out_string(c, "ERROR an unknown error happened");
+                break;
+            }
+            return;
+        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "metadump") == 0) {
+            if (settings.lru_crawler == false) {
+                out_string(c, "CLIENT_ERROR lru crawler disabled");
+                return;
+            }
+            if (!settings.dump_enabled) {
+                out_string(c, "ERROR metadump not allowed");
+                return;
+            }
+
+            int rv = lru_crawler_crawl(tokens[2].value, CRAWLER_METADUMP,
+                        c, c->sfd, LRU_CRAWLER_CAP_REMAINING);
+            switch (rv) {
+            case CRAWLER_OK:
+                out_string(c, "OK");
+                // TODO: Don't reuse conn_watch here
+                conn_set_state(c, conn_watch);
+                event_del(&c->event);
+                break;
+            case CRAWLER_RUNNING:
+                out_string(c, "BUSY currently processing crawler request");
+                break;
+            case CRAWLER_BADCLASS:
+                out_string(c, "BADCLASS invalid class id");
+                break;
+            case CRAWLER_NOTSTARTED:
+                out_string(c, "NOTSTARTED no items to crawl");
+                break;
+            case CRAWLER_ERROR:
+                out_string(c, "ERROR an unknown error happened");
+                break;
+            }
+            return;
+        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "tocrawl") == 0) {
+            uint32_t tocrawl;
+            if (!safe_strtoul(tokens[2].value, &tocrawl)) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+            settings.lru_crawler_tocrawl = tocrawl;
+            out_string(c, "OK");
+            return;
+        } else if (ntokens == 4 && strcmp(tokens[COMMAND_TOKEN + 1].value, "sleep") == 0) {
+            uint32_t tosleep;
+            if (!safe_strtoul(tokens[2].value, &tosleep)) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+            if (tosleep > 1000000) {
+                out_string(c, "CLIENT_ERROR sleep must be one second or less");
+                return;
+            }
+            settings.lru_crawler_sleep = tosleep;
+            out_string(c, "OK");
+            return;
+        } else if (ntokens == 3) {
+            if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "enable") == 0)) {
+                if (start_item_crawler_thread() == 0) {
+                    out_string(c, "OK");
+                } else {
+                    out_string(c, "ERROR failed to start lru crawler thread");
+                }
+            } else if ((strcmp(tokens[COMMAND_TOKEN + 1].value, "disable") == 0)) {
+                if (stop_item_crawler_thread() == 0) {
+                    out_string(c, "OK");
+                } else {
+                    out_string(c, "ERROR failed to stop lru crawler thread");
+                }
+            } else {
+                out_string(c, "ERROR");
+            }
+            return;
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (ntokens > 1 && strcmp(tokens[COMMAND_TOKEN].value, "watch") == 0) {
+        process_watch_command(c, tokens, ntokens);
+    } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "cache_memlimit") == 0)) {
+        process_memlimit_command(c, tokens, ntokens);
+    } else if ((ntokens == 3 || ntokens == 4) && (strcmp(tokens[COMMAND_TOKEN].value, "verbosity") == 0)) {
+        process_verbosity_command(c, tokens, ntokens);
+    } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "lru") == 0) {
+        process_lru_command(c, tokens, ntokens);
+#ifdef MEMCACHED_DEBUG
+    // commands which exist only for testing the memcached's security protection
+    } else if (ntokens == 2 && (strcmp(tokens[COMMAND_TOKEN].value, "misbehave") == 0)) {
+        process_misbehave_command(c);
+#endif
+#ifdef EXTSTORE
+    } else if (ntokens >= 3 && strcmp(tokens[COMMAND_TOKEN].value, "extstore") == 0) {
+        process_extstore_command(c, tokens, ntokens);
+#endif
+    } else {
+        if (ntokens >= 2 && strncmp(tokens[ntokens - 2].value, "HTTP/", 5) == 0) {
+            conn_set_state(c, conn_closing);
+        } else {
+            out_string(c, "ERROR");
+        }
+    }
+    return;
 }
 
 /*
@@ -451,6 +1218,38 @@ static void conn_set_state(conn *c, enum conn_states state) {
         }
         c->state = state;
     }
+}
+
+/*
+ * Ensures that there is room for another struct iovec in a connection's
+ * iov list.
+ *
+ * Returns 0 on success, -1 on out-of-memory.
+ */
+static int ensure_iov_space(conn *c) {
+    assert(c != NULL);
+
+    if (c->iovused >= c->iovsize) {
+        int i, iovnum;
+        struct iovec *new_iov = (struct iovec *)realloc(c->iov,
+                                    (c->iovsize * 2) * sizeof(struct iovec));
+        if (! new_iov) {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            return -1;
+        }
+        c->iov = new_iov;
+        c->iovsize *= 2;
+
+        /* Point all the msghdr structures at the new list. */
+        for (i = 0, iovnum = 0; i < c->msgused; i++) {
+            c->msglist[i].msg_iov = &c->iov[iovnum];
+            iovnum += c->msglist[i].msg_iovlen;
+        }
+    }
+
+    return 0;
 }
 
 /*
