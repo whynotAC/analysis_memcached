@@ -51,6 +51,13 @@ enum network_transport {
 #define IS_TCP(x) (x == tcp_transport)
 #define IS_UDP(x) (x == udp_transport)
 
+#define NREAD_ADD 1
+#define NREAD_SET 2
+#define NREAD_REPLACE 3
+#define NREAD_APPEND 4
+#define NREAD_PREPEND 5
+#define NREAD_CAS 6
+
 /** Use X macros to avoid iterating over the stats fields during reset and 
  * aggregation. No longer have to add new stats in 3+ place
  */
