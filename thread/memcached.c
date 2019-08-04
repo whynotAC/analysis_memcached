@@ -218,6 +218,107 @@ static void out_of_memory(conn *c, char *ascii_error) {
     }
 }
 
+/*
+ * we get here after reading the value in set/add.replace commands.The command
+ * has been stored in c->cmd, and the item is ready in c->item.
+ */
+static void complete_nread_ascii(conn *c) {
+    assert(c != NULL);
+
+    item *it = c->item;
+    int comm = c->cmd;
+    enum store_item_type ret;
+    bool is_valid = false;
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    if ((it->it_flags & ITEM_CHUNKED) == 0) {
+        if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) == 0) {
+            is_valid = true;
+        }
+    } else {
+        char buf[2];
+        /* should point to the final item chunk */
+        item_chunk *ch = (item_chunk *)c->ritem;
+        assert(ch->used != 0);
+        /* :( We need to look at the last two bytes. This could span two
+         * chunks.
+         */
+        if (ch->used > 1) {
+            buf[0] = ch->data[ch->used - 2];
+            buf[1] = ch->data[ch->used - 1];
+        } else {
+            assert(ch->prev);
+            assert(ch->used == 1);
+            buf[0] = ch->prev->data[ch->prev->used - 1];
+            buf[1] = ch->data[ch->used - 1];
+        }
+        if (strncmp(buf, "\r\n", 2) == 0) {
+            is_valid = true;
+        } else {
+            assert(1 == 0);
+        }
+    }
+
+    if (!is_valid) {
+        out_string(c, "CLIENT_ERROR bad data chunk");
+    } else {
+        ret = store_item(it, comm, c);
+
+#ifdef ENABLE_DTRACE
+        uint64_t cas = ITEM_get_cas(it);
+        switch (c->cmd) {
+        case NREAD_ADD:
+            MEMCACHED_COMMAND_ADD(c->sfd, ITEM_key(it), it->nkey, 
+                    (ret == 1) ? it->nbytes : -1, cas);
+            break;
+        case NREAD_REPLACE:
+            MEMCACHED_COMMAND_REPLACE(c->sfd, ITEM_key(it), it->nkey,
+                    (ret == 1) ? it->nbytes : -1, cas);
+            break;
+        case NREAD_APPEND:
+            MEMCACHED_COMMAND_APPEND(c->sfd, ITEM_key(it), it->nkey,
+                    (ret == 1) ? it->nbytes : -1, cas);
+            break;
+        case NREAD_PREPEND:
+            MEMCACHED_COMMAND_PREPEND(c->sfd, ITEM_key(it), it->nkey,
+                    (ret == 1) ? it->nbytes : -1, cas);
+            break;
+        case NREAD_SET:
+            MEMCACHED_COMMAND_SET(c->sfd, ITEM_key(it), it->nkey,
+                    (ret == 1) ? it->nbytes : -1, cas);
+            break;
+        case NREAD_CAS:
+            MEMCACHED_COMMAND_CAS(c->sfd, ITEM_key(it), it->nkey, it->nbytes,
+                    cas);
+            break;
+        }
+#endif
+
+        switch (ret) {
+        case STORED:
+            out_string(c, "STORED");
+            break;
+        case EXISTS:
+            out_string(c, "EXISTS");
+            break;
+        case NOT_FOUND:
+            out_string(c, "NOT_FOUND");
+            break;
+        case NOT_STORED:
+            out_string(c, "NOT_STORED");
+            break;
+        defalut:
+            out_string(c, "SERVER_ERROR Unhandled storage type");
+        }
+    }
+
+    item_remove(c->item);   // release the c->item reference
+    c->item = 0;
+}
+
 static const char *prot_text(enum protocol prot) {
     char *rv = "unknown";
     switch (prot) {
@@ -798,6 +899,77 @@ static int try_read_command(conn *c) {
     return 1;
 }
 
+static void complete_nread_binary(conn *c) {
+    assert(c != NULL);
+    assert(c->cmd >= 0);
+
+    switch(c->substate) {
+    case bin_reading_set_header:
+        if (c->cmd == PROTOCOL_BINARY_CMD_APPEND || 
+                c->cmd == PROTOCOL_BINARY_CMD_PREPEND) {
+            process_bin_append_prepend(c);
+        } else {
+            process_bin_update(c);
+        }
+        break;
+    case bin_read_set_value:
+        complete_update_bin(c);
+        break;
+    case bin_reading_get_key:
+    case bin_reading_touch_key:
+        process_bin_get_or_touch(c);
+        break;
+    case bin_reading_stat:
+        process_bin_stat(c);
+        break;
+    case bin_reading_del_header:
+        process_bin_delete(c);
+        break;
+    case bin_reading_incr_header:
+        process_incr_bin(c);
+        break;
+    case bin_read_flush_exptime:
+        process_bin_flush(c);
+        break;
+    case bin_reading_sasl_auth:
+        process_bin_sasl_auth(c);
+        break;
+    case bin_reading_sasl_auth_data:
+        process_bin_complete_sasl_auth(c);
+        break;
+    default:
+        printf(stderr, "Not handling substate %d\n", c->substate);
+        assert(0);
+    }
+}
+
+static void reset_cmd_handler(conn *c) {
+    c->cmd = -1;
+    c->substate = bin_no_state;
+    if (c->item != NULL) {
+        item_remove(c->item);
+        c->item = NULL;
+    }
+    conn_shrink(c);
+    if (c->rbytes > 0) {
+        conn_set_state(c, conn_parse_cmd);
+    } else {
+        conn_set_state(c, conn_waiting);
+    }
+}
+
+static void complete_nread(conn *c) {
+    assert(c != NULL);
+    assert(c->protocol == ascii_prot ||
+            c->protocol == binary_prot);
+
+    if (c->protocol == ascii_prot) {
+        complete_nread_ascii(c);
+    } else if (c->protocol == binary_prot) {
+        complete_nread_binary(c);
+    }
+}
+
 typedef struct token_s {
     char *value;
     size_t length;
@@ -898,6 +1070,255 @@ static inline bool set_noreply_maybe(conn *c, token_t *tokens, size_t ntokens) {
         c->noreply = true;
     }
     return c->noreply;
+}
+
+inline static process_stats_detail(conn *c, const char *command) {
+    assert (c != NULL);
+
+    if (strcmp(command, "on") == 0) {
+        settings.detail_enabled = 1;
+        out_string(c, "OK");
+    } else if (strcmp(command, "off") == 0) {
+        settings.detail_enabled = 0;
+        out_string(c, "OK");
+    } else if (strcmp(command, "dump") == 0) {
+        int len;
+        char *stats = stats_prefix_dump(&len);
+        write_and_free(c, stats, len);
+    } else {
+        out_string(c, "CLIENT_ERROR usage: stats detail on|off|dump");
+    }
+}
+
+/* return server specific stats only */
+static void server_stats(ADD_STAT add_stats, conn *c) {
+    pid_t pid = getpid();
+    rel_time_t now = current_time;
+
+    struct thread_stats thread_stats;
+    threadlocal_stats_aggregate(&thread_stats);
+    struct slab_stats slab_stats;
+    slab_stats_aggregate(&thread_stats, &slab_stats);
+#ifdef EXTSTORE
+    struct extstore_stats st;
+#endif
+#ifndef WIN32
+    struct rusage usage;
+    getrusage(RUSAGE_SELF, &usage);
+#endif
+
+    STATS_LOCK();
+
+    APPEND_STAT("pid", "%lu", (long)pid);
+    APPEND_STAT("uptime", "%u", now - ITEM_UPDATE_INTERVAL);
+    APPEND_STAT("time", "%ld", now + (long)process_started);
+    APPEND_STAT("version", "%s", VERSION);
+    APPEND_STAT("libevent", "%s", event_get_version());
+    APPEND_STAT("pointer_size", "%d", (int)(8 * sizeof(void *)));
+
+#ifndef WIN32
+    append_stat("rusage_user", add_stats, c, "%ld.%06ld",
+                (long)usage.ru_utime.tv_sec,
+                (long)usage.ru_utime.tv_usec);
+    append_stat("rusage_system", add_stats, c, "%ld.%06ld",
+                (long)usage.ru_stime.tv_sec,
+                (long)usage.ru_stime.tv_usec);
+#endif
+
+    APPEND_STAT("max_connections", "%d", settings.maxconns);
+    APPEND_STAT("curr_connections", "%llu", (unsigned long long)stats_state.curr_conns - 1);
+    APPEND_STAT（"total_connections", "%llu", (unsigned long long)stats.total_conns);
+    if (settings.maxconns_fast) {
+        APPEND_STAT("rejected_connections", "%llu", (unsigned long long)stats.rejected_conns);
+    }
+    APPEND_STAT("connection_structures", "%u", stats_state.conn_structs);
+    APPEND_STAT("reserved_fds", "%u", stats_state.reserved_fds);
+    APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
+    APPEND_STAT("cmd_set", "%llu", (unsigned long long)slab_stats.set_cmds);
+    APPEND_STAT("cmd_flush", "%llu", (unsigned long long)thread_stats.flush_cmds);
+    APPEND_STAT("cmd_touch", "%llu", (unsigned long long)thread_stats.touch_cmds);
+    APPEND_STAT("get_hits", "%llu", (unsigned long long)slab_stats.get_hits);
+    APPEND_STAT("get_misses", "%llu", (unsigned long long)thread_stats.get_misses);
+    APPEND_STAT("get_expired", "%llu", (unsigned long long)thread_stats.get_expired);
+    APPEND_STAT("get_flushed", "%llu", (unsigned long long)thread_stats.get_flushed);
+#ifdef EXTSTORE
+    if (c->thread->storage) {
+        APPEND_STAT("get_extstore", "%llu", (unsigned long long)thread_stats.get_extstore);
+        APPEND_STAT("recache_from_extstore", "%llu", (unsigned long long)thread_stats.recache_from_extstore);
+        APPEND_STAT("miss_from_extstore", "%llu", (unsigned long long)thread_stats.miss_from_extstore);
+        APPEND_STAT("badcrc_from_extstore", "%llu", (unsigned long long)thread_stats.badcrc_from_extstore);
+    }
+#endif
+    APPEND_STAT("delete_misses", "%llu", (unsigned long long)thread_stats.delete_misses);
+    APPEND_STAT("delete_hits", "%llu", (unsigned long long)slab_stats.delete_hits);
+    APPEND_STAT("incr_misses", "%llu", (unsigned long long)thread_stats.incr_misses);
+    APPEND_STAT("incr_hits", "%llu", (unsigned long long)slab_stats.incr_hits);
+    APPEND_STAT("decr_misses", "%llu", (unsigned long long)thread_stats.decr_misses);
+    APPEND_STAT("decr_hits", "%llu", (unsigned long long)slab_stats.decr_hits);
+    APPEND_STAT("cas_misses", "%llu", (unsigned long long)thread_stats.cas_misses);
+    APPEND_STAT("cas_hits", "%llu", (unsigned long long)slab_stats.cas_hits);
+    APPEND_STAT("cas_badval", "%llu", (unsigned long long)slab_stats.cas_badval);
+    APPEND_STAT("touch_hits", "%llu", (unsigned long long)slab_stats.touch_hits);
+    APPEND_STAT("touch_misses", "%llu", (unsigned long long)thread_stats.touch_misses);
+    APPEND_STAT("auth_cmds", "%llu", (unsigned long long)thread_stats.auth_cmds);
+    APPEND_STAT("auth_errors", "%llu", (unsigned long long)thread_stats.auth_errors);
+    if (settings.idle_timeout) {
+        APPEND_STAT("idle_kicks", "%llu", (unsigned long long)thread_stats.idle_kicks);
+    }
+    APPEND_STAT("bytes_read", "%llu", (unsigned long long)thread_stats.bytes_read);
+    APPEND_STAT("bytes_written", "%llu", (unsigned long long)thread_stats.bytes_written);
+    APPEND_STAT("limit_maxbytes", "%llu", (unsigned long long)settings.maxbytes);
+    APPEND_STAT("accepting_conns", "%u", stats_state.accepting_conns);
+    APPEND_STAT("listen_disabled_num", "%llu", (unsigned long long)stats.listen_disabled_num);
+    APPEND_STAT("time_in_listen_disabled_us", "%llu", stats.time_in_listen_disabled_us);
+    APPEND_STAT("threads", "%d", settings.num_threads);
+    APPEND_STAT("conn_yields", "%llu", (unsigned long long)thread_stats.conn_yields);
+    APPEND_STAT("hash_power_level", "%u", stats_state.hash_power_level);
+    APPEND_STAT("hash_bytes", "%llu", (unsigned long long)stats_state.hash_bytes);
+    APPEND_STAT("hash_is_expanding", "%u", stats_state.hash_is_expanding);
+    if (settings.slab_reassign) {
+        APPEND_STAT("slab_reassign_rescues", "%llu", stats.slab_reassign_rescues);
+        APPEND_STAT("slab_reassign_chunk_rescues", "%llu", stats.slab_reassign_chunk_rescues);
+        APPEND_STAT("slab_reassign_evictions_nomem", "%llu", stats.slab_reassign_evictions_nomem);
+        APPEND_STAT("slab_reassign_inline_reclaim", "%llu", stats.slab_reassign_inline_reclaim);
+        APPEND_STAT("slab_reassign_busy_items", "%llu", stats.slab_reassign_busy_items);
+        APPEND_STAT("slab_reassign_busy_deletes", "%llu", stats.slab_reassign_busy_deletes);
+        APPEND_STAT("slab_reassign_running", "%u", stats_state.slab_reassign_running);
+        APPEND_STAT("slabs_moved", "%llu", stats.slabs_moved);
+    }
+    if (settings.lru_crawler) {
+        APPEND_STAT("lru_crawler_running", "%u", stats_state.lru_crawler_running);
+        APPEND_STAT("lru_crawler_starts", "%u", stats.lru_crawler_starts);
+    }
+    if (settings.lru_maintainer_thread) {
+        APPEND_STAT("lru_maintainer_juggles", "%llu", (unsigned long long)stats.lru_maintainer_juggles);
+    }
+    APPEND_STAT("malloc_fails", "%llu", (unsigned long long)stats.malloc_fails);
+    APPEND_STAT("log_worker_dropped", "%llu", (unsigned long long)stats.log_worker_dropped);
+    APPEND_STAT("log_worker_written", "%llu", (unsigned long long)stats.log_worker_written);
+    APPEND_STAT("log_watcher_skipped", "%llu", (unsigned long long)stats.log_watcher_skipped);
+    APPEND_STAT("log_watcher_sent", "%llu", (unsigned long long)stats.log_watcher_sent);
+    STATS_UNLOCK();
+#ifdef EXTSTORE
+    if (c->thread->storage) {
+        STATS_LOCK();
+        APPEND_STAT("extstore_compact_lost", "%llu", (unsigned long long)stats.extstore_compact_lost);
+        APPEND_STAT("extstore_compact_rescues", "%llu", (unsigned long long)stats.extstore_compact_rescues);
+        APPEND_STAT("extstore_compact_skipped", "%llu", (unsigned long long)stats.extstore_compact_skipped);
+        STATS_UNLOCK();
+        extstore_get_stats(c->thread->storage, &st);
+        APPEND_STAT("extstore_page_allocs", "%llu", (unsigned long long)st.page_allocs);
+        APPEND_STAT("extstore_page_evictions", "%llu", (unsigned long long)st.page_evictions);
+        APPEND_STAT("extstore_page_reclaims", "%llu", (unsigned long long)st.page_reclaims);
+        APPEND_STAT("extstore_pages_free", "%llu", (unsigned long long)st.pages_free);
+        APPEND_STAT("extstore_pages_used", "%llu", (unsigned long long)st.pages_used);
+        APPEND_STAT("extstore_objects_evicted", "%llu", (unsigned long long)st.objects_evicted);
+        APPEND_STAT("extstore_objects_read", "%llu", (unsigned long long)st.objects_read);
+        APPEND_STAT("extstore_objects_written", "%llu", (unsigned long long)st.objects_written);
+        APPEND_STAT("extstore_objects_used", "%llu", (unsigned long long)st.objects_used);
+        APPEND_STAT("extstore_bytes_evicted", "%llu", (unsigned long long)st.bytes_evicted);
+        APPEND_STAT("extstore_bytes_written", "%llu", (unsigned long long)st.bytes_written);
+        APPEND_STAT("extstore_bytes_read", "%llu", (unsigned long long)st.bytes_read);
+        APPEND_STAT("extstore_bytes_used", "%llu", (unsigned long long)st.bytes_used);
+        APPEND_STAT("extstore_bytes_fragmented", "%llu", (unsigned long long)st.bytes_fragmented);
+        APPEND_STAT("extstore_limit_maxbytes", "%llu", (unsigned long long)(st.page_count * st.page_size));
+    }
+#endif
+}
+
+static void process_stat_settings(ADD_STAT add_stats, void *c) {
+    assert(add_stats);
+    APPEND_STAT("maxbytes", "%llu", (unsigned long long)settings.maxbytes);
+    APPEND_STAT("maxconns", "%d", settings.maxconns);
+    APPEND_STAT("tcpport", "%d", settings.port);
+    APPEND_STAT("udpport", "%d", settings.udpport);
+    APPEND_STAT("inter", "%s", settings.inter ? settings.inter : "NULL");
+    APPEND_STAT("verbosity", "%d", settings.verbose);
+    APPEND_STAT("oldest", "%lu", (unsigned long)settings.oldest_live);
+    APPEND_STAT("evictions", "%s", settings.evict_to_free ? "on" : "off");
+    APPEND_STAT("domain_socket", "%s",
+            settings.socketpath ? settings.socketpath : "NULL");
+    APPEND_STAT("umask", "%o", settings.access);
+    APPEND_STAT("growth_factor", "%.2f", settings.factor);
+    APPEND_STAT("chunk_size", "%d", settings.chunk_size);
+    APPEND_STAT("num_threads", "%d", settings.num_threads);
+    APPEND_STAT("num_threads_per_udp", "%d", settings.num_threads_per_udp);
+    APPEND_STAT("stat_key_prefix", "%c", settings.prefix_delimiter);
+    APPEND_STAT("detail_enabled", "%s",
+            settings.detail_enabled ? "yes" : "no");
+    APPEND_STAT("reqs_per_event", "%d", settings.reqs_per_event);
+    APPEND_STAT("cas_enabled", "%s", settings.use_cas ? "yes" : "no");
+    APPEND_STAT("tcp_backlog", "%d", settings.backlog);
+    APPEND_STAT("binding_protocol", "%s", prot_text(settings.binding_protocol));
+    APPEND_STAT("auth_enabled_sasl", "%s", settings.sasl ? "yes" : "no");
+    APPEND_STAT("item_size_max", "%d", settings.item_size_max);
+    APPEND_STAT("maxconns_fast", "%s", settings.maxconns_fast ? "yes" : "no");
+    APPEND_STAT("hashpower_init", "%d", settings.hashpower_init);
+    APPEND_STAT("slab_reassign", "%s", settings.slab_reassign ? "yes" : "no");
+    APPEND_STAT("slab_automvoe", "%d", settings.slab_automove);
+    APPEND_STAT("slab_automove_ratio", "%.2f", settings.slab_automove_ratio);
+    APPEND_STAT("slab_automove_window", "%u", settings.slab_automove_window);
+    APPEND_STAT("slab_chunk_max", "%d", settings.slab_chunk_size_max);
+    APPEND_STAT("lru_crawler", "%s", settings.lru_crawler ? "yes" : "no");
+    APPEND_STAT("lru_crawler_sleep", "%d", settings.lru_crawler_sleep);
+    APPEND_STAT("lru_crawler_tocrawl", "%lu", (unsigned long)settings.lru_crawler_tocrawl);
+    APPEND_STAT("tail_repair_time", "%d", settings.tail_repair_time);
+    APPEND_STAT("flush_enabled", "%s", settings.flush_enabled ? "yes" : "no");
+    APPEND_STAT("dump_enabled", "%s", setitngs.dump_enabled ? "yes" : "no");
+    APPEND_STAT("hash_algorithm", "%s", settings.hash_algorithm);
+    APPEND_STAT("lru_maintainer_thread", "%s", settings.lru_maintainer_thread ? "yes" : "no");
+    APPEND_STAT("lru_segmented", "%s", settings.lru_segmented ? "yes" : "no");
+    APPEND_STAT("hot_lru_pct", "%d", settings.hot_lru_pct);
+    APPEND_STAT("warm_lru_pct", "%d", settings.warm_lru_pct);
+    APPEND_STAT("hot_max_factor", "%.2f", settings.hot_max_factor);
+    APPEND_STAT("warm_max_factor", "%.2f", settings.warm_max_factor);
+    APPEND_STAT("temp_lru", "%s", settings.temp_lru ? "yes" : "no");
+    APPEND_STAT("temporary_ttl", "%u", settings.temporary_ttl);
+    APPEND_STAT("idle_timeout", "%d", settings.idle_timeout);
+    APPEND_STAT("watcher_logbuf_size", "%u", settings.logger_watcher_buf_size);
+    APPEND_STAT("worker_logbuf_size", "%u", settings.logger_buf_size);
+    APPEND_STAT("track_sizes", "%s", item_stats_sizes_status() ? "yes" : "no");
+    APPEND_STAT("inline_ascii_response", "%s", settings.inline_ascii_response ? "yes" : "no");
+#ifdef EXTSTORE
+    APPEND_STAT("ext_item_size", "%u", settings.ext_item_size);
+    APPEND_STAT("ext_item_age", "%u", settings.ext_item_age);
+    APPEND_STAT("ext_low_ttl", "%u", settings.ext_low_ttl);
+    APPEND_STAT("ext_recache_rate", "%u", settings.ext_recache_rate);
+    APPEND_STAT("ext_wbuf_size", "%u", settings.ext_wbuf_size);
+    APPEND_STAT("ext_compact_under", "%u", settings.ext_compact_under);
+    APPEND_STAT("ext_drop_under", "%u", settings.ext_drop_under);
+    APPEND_STAT("ext_max_frag", "%.2f", settings.ext_max_frag);
+    APPEND_STAT("slab_automove_freeratio", "%.3f", settings.slab_automove_freeratio);
+    APPEND_STAT("ext_drop_unread", "%s", settings.ext_drop_unread ? "yes" : "no");
+#endif
+}
+
+static void process_stats_conns(ADD_STAT add_stats, void *c) {
+    int i;
+    char key_str[STAT_KEY_LEN];
+    char val_str[STAT_VAL_LEN];
+    char conn_name[MAXPTAH + sizeof("unix:") + sizeof("65535")];
+    int klen = 0, vlen = 0;
+
+    assert(add_stats);
+
+    for (i = 0; i < max_fds; i++) {
+        if (conns[i]) {
+            /* This is safe to unlocked beaause conns are never freed; the
+             * worst that'll happen will be a minor inconsistency in the
+             * output -- not worth the complexity of the locking that'd
+             * be required to prevent it.
+             */
+            if (conns[i]->state != conn_closed) {
+                conn_to_str(conns[i], conn_name);
+
+                APPEND_NUM_STAT(i, "addr", "%s", conn_name);
+                APPEND_NUM_STAT(i, "state", "%s", state_text(conns[i]->state));
+                APPEND_NUM_STAT(i, "secs_since_last_cmd", "%d", current_time - 
+                    conns[i]->last_cmd_time);
+            }
+        }
+    }
 }
 
 static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
@@ -1421,6 +1842,234 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         out_string(c, "NOT_FOUND");
     }
 }
+
+static void process_verbosity_command(conn *c, token_t *tokens, const size_t ntokens) {
+    unsigned int level;
+
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    level = strtoul(tokens[1].value, NULL, 10);
+    settings.verbose = level > MAX_VERBOSITY_LEVEL ? MAX_VERBOSITY_LEVEL : level;
+    out_string(c, "OK");
+    return;
+}
+
+static void process_slabs_automove_command(conn *c, token_t *tokens, const size_t ntokens) {
+    unsigned int level;
+    double ratio;
+
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    if (strcmp(tokens[2].value, "ratio") == 0) {
+        if (ntokens < 5 || !safe_strtod(tokens[3].value, &ratio)) {
+            out_string(c, "ERROR");
+            return;
+        }
+        settings.slab_automove_ratio = ratio;
+    } else {
+        level = strtoul(stokens[2].value, NULL, 10);
+        if (level == 0) {
+            settings.slab_automove = 0;
+        } else if (level == 1 || level == 2) {
+            settings.slab_automove = level;
+        } else {
+            out_string(c, "ERROR");
+            return;
+        }
+    }
+    out_string(c, "OK");
+    return;
+}
+
+/* TODO: decide on syntax for sampling? */
+static void process_watch_command(conn *c, token_t *tokens, const size_t ntokens) {
+    uint16_t f = 0;
+    int x;
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+    if (ntokens > 2) {
+        for (x = COMMAND_TOKEN + 1; x < ntokens - 1; x++) {
+            if ((strcmp(tokens[x].value, "rawcmds") == 0)) {
+                f |= LOG_RAWCMDS;
+            } else if (strcmp(tokens[x].value, "evictions") == 0) {
+                f |= LOG_EVICTIONS;
+            } else if (strcmp(tokens[x].value, "fetchers") == 0) {
+                f |= LOG_FETCHERS;
+            } else if (strcmp(tokens[x].value, "mutations") == 0) {
+                f |= LOG_MUTATIONS;
+            } else if ((strcmp(tokens[x].value, "sysevents") == 0)) {
+                f |= LOG_SYSEVENTS;
+            } else {
+                out_string(c, "ERROR");
+                return;
+            }
+        }
+    } else {
+        f |= LOG_FETCHERS;
+    }
+
+    switch (logger_add_watcher(c, c->sfd, f)) {
+        case LOGGER_ADD_WATCHER_TOO_MANY:
+            out_string(c, "WATCHER_TOO_MANY log watcher limit reached");
+            break;
+        case LOGGER_ADD_WATCHER_FAILED:
+            out_string(c, "WATCHER_FAILED failed to add log watcher");
+            break;
+        case LOGGER_ADD_WATCHER_OK:
+            conn_set_state(c, conn_watch);
+            event_del(&c->event);
+            break;
+    }
+}
+
+static void process_memlimit_command(conn *c, token_t *tokens, const size_t ntokens) {
+    uint32_t memlimit;
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    if (!safe_strtoul(tokens[1].value, &memlimit)) {
+        out_string(c, "ERROR");
+    } else {
+        if (memlimit < 8) {
+            out_string(c, "MEMLIMIT_TOO_SMALL cannot set maxbytes to less than 8m");
+        } else {
+            if (memlimit > 1000000000) {
+                out_string(c, "MEMLIMIT_ADJUST_FAILED input value is megabytes not bytes");
+            } else if (slabs_adjust_mem_limit((size_t) memlimit * 1024 * 1024)) {
+                if (settings.verbose > 0) {
+                    fprintf(stderr, "maxbytes adjusted to %llum\n", (unsigned long long)memlimit);
+                }
+
+                out_string(c, "OK")；
+            } else {
+                out_string(c, "MEMLIMIT_ADJUST_FAILED out of bounds or unable to adjust");
+            }
+        }
+    }
+}
+
+static void process_lru_command(conn *c, token_t *tokens, const size_t ntokens) {
+    uint32_t pct_hot;
+    uint32_t pct_warm;
+    double hot_factor;
+    int32_t ttl;
+    double factor;
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    if (strcmp(tokens[1].value, "tune") == 0 && ntokens >= 7) {
+        if (!safe_strtoul(tokens[2].value, &pct_hot) || 
+            !safe_strtoul(tokens[3].value, &pct_warm) ||
+            !safe_strtod(tokens[4].value, &hot_factor) ||
+            !safe_strtod(tokens[5].value, &factor)) {
+            out_string(c, "ERROR");
+        } else {
+            if (pct_hot + pct_warm > 80) {
+                out_string(c, "ERROR hot and warm pcts must not exceed 80");
+            } else if (factor <= 0 || hot_factor <= 0) {
+                out_string(c, "ERROR hot/warm age factors must be greater than 0");
+            } else {
+                settings.hot_lru_pct = pct_hot;
+                settings.warm_lru_pct = pct_warm;
+                settings.hot_max_factor = hot_factor;
+                settings.warm_max_factor = factor;
+                out_string(c, "OK");
+            }
+        }
+    } else if (strcmp(tokens[1].value, "mode") == 0 && ntokens >= 3 &&
+                settings.lru_maintainer_thread) {
+        if (strcmp(tokens[2].value, "flat") == 0) {
+            settings.lru_segmented = false;
+            out_string(c, "OK");
+        } else if (strcmp(tokens[2].value, "segmented") == 0) {
+            settings.lru_segmented = true;
+            out_string(c, "OK");
+        } else {
+            out_string(c, "ERROR");
+        }
+    } else if (strcmp(tokens[1].value, "temp_ttl") == 0 && ntokens >= 3 &&
+                settings.lru_maintainer_thread) {
+        if (!safe_strtol(tokens[2].value, &ttl)) {
+            out_string(c, "ERROR")；
+        } else {
+            if (ttl < 0) {
+                settings.temp_lru = false;
+            } else {
+                settings.temp_lru = true;
+                settings.temporary_ttl = ttl;
+            }
+            out_string(c, "OK");
+        }
+    } else {
+        out_string(c, "ERROR");
+    }
+}
+#ifdef EXTSTORE
+static void process_extstore_command(conn *c, token_t *tokens, const size_t ntokens) {
+    set_noreply_maybe(c, tokens, ntokens);
+    bool ok = true;
+    if (ntokens < 4) {
+        ok = false;
+    } else if (strcmp(tokens[1].value, "free_memchunks") == 0 && ntokens > 4) {
+        /* pre-slab-class free chunk setting. */
+        unsigned int clsid = 0;
+        unsigned int limit = 0;
+        if (!safe_strtoul(tokens[2].value, &clsid) || 
+                !safe_strtoul(tokens[3].value, &limit)) {
+            ok = false;
+        } else {
+            if (clsid < MAX_NUMBER_OF_SLAB_CLASSES) {
+                settings.ext_free_memchunks[clsid] = limit;
+            } else {
+                ok = false;
+            }
+        }
+    } else if (strcmp(tokens[1].value, "item_size") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_item_size)) {
+            ok = false;
+        }
+    } else if (strcmp(tokens[1].value, "item_age") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_item_age)) {
+            ok = false;
+        }
+    } else if (strcmp(tokens[1].value, "low_ttl") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_low_ttl))
+            ok = false;
+    } else if (strcmp(tokens[1].value, "recache_rate") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_recache_rate))
+            ok = false;
+    } else if (strcmp(tokens[1].value, "compact_under") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_compact_under))
+            ok = false;
+    } else if (strcmp(tokens[1].value, "drop_under") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_drop_under))
+            ok = false;
+    } else if (strcmp(tokens[1].value, "max_frag") == 0) {
+        if (!safe_strtoul(tokens[2].value, &settings.ext_max_frag))
+            ok = false;
+    } else if (strcmp(tokens[1].value, "drop_unread") == 0) {
+        unsigned int v;
+        if (!safe_strtoul(tokens[2].value, &v)) {
+            ok = false;
+        } else {
+            settings.ext_drop_unread = v == 0 ? false : true;
+        }
+    } else {
+        ok = false;
+    }
+    if (!ok) {
+        out_string(c, "ERROR");
+    } else {
+        out_string(c, "OK");
+    }
+}
+#endif
 
 static void process_command(conn *c, char *command) {
     token_t tokens[MAX_TOKENS];
