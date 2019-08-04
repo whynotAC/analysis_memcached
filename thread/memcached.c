@@ -160,6 +160,64 @@ static int add_iov(conn *c, const void *buf, int len) {
     return 0;
 }
 
+static void out_string(conn *c, const char *str) {
+    size_t len;
+
+    assert(c != NULL);
+
+    if (c->noreply) {
+        if (settings.verbose > 1)
+            fprintf(stderr, ">%d NOREPLY %s\n", c->sfd, str);
+        c->noreply = false;
+        conn_set_state(c, conn_new_cmd);
+        return;
+    }
+
+    if (settings.verbose > 1)
+        fprintf(stderr, ">%d %s\n", c->sfd, str);
+
+    /* Nuke a partial output... */
+    c->msgcurr = 0;
+    c->msgused = 0;
+    c->iovused = 0;
+    add_msghdr(c);
+
+    len = strlen(str);
+    if ((len + 2) > c->wsize) {
+        /* ought to be always enough, just fail for simplicity */
+        str = "SERVER_ERROR output line too long";
+        len = strlen(str);
+    }
+
+    memcpy(c->wbuf, str, len);
+    memcoy(c->wbuf + len, "\r\n", 2);
+    c->wbytes = len + 2;
+    c->wcurr = c->wbuf;
+
+    conn_set_state(c, conn_write);
+    c->write_and_go = conn_new_cmd;
+    return;
+}
+
+/*
+ * Outputs a protocol-specific "out of memory" error. For ASCII clients,
+ * this is equivalent to out_string().
+ */
+static void out_of_memory(conn *c, char *ascii_error) {
+    const static char error_prefix[] = "SERVER_ERROR ";
+    const static int error_prefix_len = sizeof(error_prefix) - 1;
+
+    if (c->protocol == binary_prot) {
+        /* Strip off the generic error prefix; it's irrelevant in binary */
+        if (!strncmp(ascii_error, error_prefix, error_prefix_len)) {
+            ascii_error += error_prefix_len;
+        }
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, ascii_error, 0);
+    } else {
+        out_string(c, ascii_error);
+    }
+}
+
 static const char *prot_text(enum protocol prot) {
     char *rv = "unknown";
     switch (prot) {
@@ -738,6 +796,630 @@ static int try_read_command(conn *c) {
     }
 
     return 1;
+}
+
+typedef struct token_s {
+    char *value;
+    size_t length;
+} token_t;
+
+#define COMMAND_TOKEN 0
+#define SUBCOMMAND_TOKEN 1
+#define KEY_TOKEN 1
+
+#define MAX_TOKENS 8
+
+/*
+ * Tokenize the command string by replacing whitespace with '\0' and update
+ * the token array tokens with pointer to start of each token and length.
+ * Returns total number of tokens. The last valid token is the terminal
+ * token (value points to the first unprocessed character of the string and
+ * length zero)
+ *
+ * Usage example:
+ *
+ *  while(tokenize_command(command, ncommand, tokens, max_tokens > 0) {
+ *      for(int ix = 0; tokens[ix].length != 0; ix++) {
+ *          ···
+ *      }
+ *      ncommand = tokens[ix].value - command;
+ *      command = tokens[ix].value;
+ *  }
+ */
+static size_t tokenize_command(char *command, token_t *tokens, const size_t max_tokens) {
+    char *s, *e;
+    size_t ntokens = 0;
+    size_t len = strlen(command);
+    unsigned int i = 0;
+
+    assert(command != NULL && tokens != NULL && max_tokens > 1);
+
+    s = e = command;
+    for (i = 0; i < len; i++) {
+        if (*e == ' ') {
+            if (s != e) {
+                tokens[ntokens].value = s;
+                tokens[ntokens].length = e - s;
+                ntokens++;
+                *e = '\0';
+                if (ntokens == max_tokens - 1) {
+                    e++;
+                    s = e; // so we don't add an extra token
+                    break;
+                }
+            }
+            s = e + 1;
+        }
+        e++;
+    }
+
+    if (s != e) {
+        tokens[ntokens].value = s;
+        tokens[ntokens].length = e - s;
+        ntokens++;
+    }
+
+    /*
+     * If we scanned the whole string, the terminal value pointer is null,
+     * otherwise it si the first unprocessed character.
+     */
+    tokens[ntokens].value = *e == '\0' ? NULL : e;
+    tokens[ntokens].length = 0;
+    ntokens++;
+
+    return ntokens;
+}
+
+/* set up a connection to write a buffer then free it, used for stats */
+static void write_and_free(conn *c, char *buf, int bytes) {
+    if (buf) {
+        c->write_and_free = buf;
+        c->wcurr = buf;
+        c->wbytes = bytes;
+        conn_set_state(c, conn_write);
+        c->write_and_go = conn_new_cmd;
+    } else {
+        out_of_memory(c, "SERVER_ERROR out of memory writin stats");
+    }
+}
+
+static inline bool set_noreply_maybe(conn *c, token_t *tokens, size_t ntokens) {
+    int noreply_index = ntokens - 2;
+
+    /*
+     * Note: this function is not the first place where we are going to 
+     * send the reply. We could send it instead from process_command()
+     * if the request line has wrong number of tokens. However parsing
+     * malformed line for "noreply" option is not reliable anyway, so
+     * it can't be helped.
+     */
+    if (tokens[noreply_index].value
+            && strcmp(tokens[noreply_index].value, "noreply") == 0) {
+        c->noreply = true;
+    }
+    return c->noreply;
+}
+
+static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
+    const char *subcommand = tokens[SUBCOMMAND_TOKEN].value;
+    assert(c != NULL);
+
+    if (ntokens < 2) {
+        out_string(c, "CLIENT_ERROR bad command line");
+        return;
+    }
+
+    if (ntokens == 2) {
+        server_stats(&append_stats, c);
+        (void)get_stats(NULL, 0, &append_stats, c);
+    } else if (strcmp(subcommand, "reset") == 0) {
+        stats_reset();
+        out_string(c, "RESET ");
+        return ;
+    } else if (strcmp(subcommand, "detail") == 0) {
+        /* NOTE: how to tackle detail with binary? */
+        if (ntokens < 4) 
+            process_stats_detail(c, "");    // outputs the error message
+        else 
+            process_stats_detail(c, tokens[2].value);
+        /* Output already generated */
+        return ;
+    } else if (strcmp(subcommand, "settings") == 0) {
+        process_stat_settings(&append_stats, c);
+    } else if (strcmp(subcommand, "cachedump") == 0) {
+        char *buf;
+        unsigned int bytes, id, limit = 0;
+
+        if (!settings.dump_enabled) {
+            out_string(c, "CLIENT_ERROR stats cachedump not allowed");
+            return;
+        }
+
+        if (ntokens < 5) {
+            out_string(c, "CLIENT_ERROR bad command line");
+            return;
+        }
+
+        if (!safe_strtoul(tokens[2].value, &id) || 
+            !safe_strtoul(tokens[3].value, &limit)) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+
+        if (id >= MAX_NUMBER_OF_SLAB_CLASSES) {
+            out_string(c, "CLIENT_ERROR Illegal slab id");
+            return;
+        }
+
+        buf = item_cachedump(id, limit, &bytes);
+        write_and_free(c, buf, bytes);
+        return ;
+    } else if (strcmp(subcommand, "conns") == 0) {
+        process_stats_conns(&append_stats, c);
+#ifdef EXTSTORE
+    } else if (strcmp(subcommand, "extstore") == 0) {
+        process_extstore_stats(&append_stats, c);
+#endif
+    } else {
+        /* getting here means that subcommand is either engine specific or
+         * is invalid. query the engine and see. */
+        if (get_stats(subcommand, strlen(subcommand), &append_stats, c)) {
+            if (c->stats.buffer == NULL) {
+                out_of_memory(c, "SERVER_ERROR out of memory writing stats");
+            } else {
+                write_and_free(c, c->stats.buffer, c->stats.offset);
+                c->stats.buffer = NULL;
+            }
+        } else {
+            out_string(c, "ERROR");
+        }
+        return;
+    }
+
+    /* append terminator and start the transfer */
+    append_stats(NULL, 0, NULL, 0, c);
+
+    if (c->stats.buffer == NULL) {
+        out_of_memory(c, "SERVER_ERROR out of memory writing stats");
+    } else {
+        write_and_free(c, c->stats.buffer, c->stats.offset);
+        c->stats.buffer = NULL;
+    }
+}
+
+/**
+ * FIXME: the 'breaks' around memory malloc's should break all the way down
+ * fill ileft/suffixleft, then run conn_releaseitems()
+ * ntokens is overwritten here... shrung... */
+static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens, bool return_cas, bool should_touch) {
+    char *key;
+    size_t nkey;
+    int i = 0;
+    int si = 0;
+    item *it;
+    token_t *key_token = &tokens[KEY_TOKEN];
+    char *suffix;
+    int32_t exptime_int = 0;
+    rel_time_t exptime = 0;
+    assert(c != NULL);
+
+    if (should_touch) {
+        // For get and touch commands, use first token as exptime
+        if (!safe_strtol(tokens[1].value, &exptime_int)) {
+            out_string(c, "CLIENT_ERROR invalid exptime argument");
+            return;
+        }
+        key_token++;
+        exptime = realtime(exptime_int);
+    }
+
+    do {
+        while (key_token->length != 0) {
+            
+            key = key_token->value;
+            nkey = key_token->length;
+
+            if (nkey > KEY_MAX_LENGTH) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                while (i-- > 0) {
+                    item_remove(*(c->ilist + i));
+                    if (return_cas || !settings.inline_ascii_response) {
+                        do_cache_free(c->thread->suffix_cache, *(c->suffixlist + i));
+                    }
+                }
+                return;
+            }
+
+            it = limited_get(key, nkey, c, exptime, should_touch);
+            if (settings.detail_enabled) {
+                stats_prifix_record_get(key, nkey, NULL != it);
+            }
+            if (it) {
+                if (_ascii_get_expand_ilist(c, i) != 0) {
+                    item_remove(it);
+                    break;  // FIXME: Should bail down to error
+                }
+
+                /*
+                 * Contruct the response. Each hit adds three elements to the 
+                 * outgoing data list:
+                 *      "VALUE "
+                 *      key
+                 *      " " + flags + " " + data length +"\r\n" + data (with
+                 *      \r\n)
+                 */
+                if (return_cas || !settings.inline_ascii_response) {
+                    MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                                            it->nbytes, ITEM_get_cas(it));
+                    int nbytes;
+                    suffix = _ascii_get_suffix_buf(c, si);
+                    if (suffix == NULL) {
+                        item_remove(it);
+                        break;
+                    }
+                    si++;
+                    nbytes = it->nbytes;
+                    int suffix_len = make_ascii_get_suffix(suffix, it, return_cas, nbytes);
+                    if (add_iov(c, "VALUE", 6) != 0 || 
+                            add_iov(c, ITEM_key(it), it->nkey) != 0 ||
+                            (settings.inline_ascii_response && add_iov(c, ITEM_suffix(it), it->nsuffix - 2) != 0) ||
+                            add_iov(c, suffix, suffix_len) != 0) {
+                        item_remove(it);
+                        break;
+                    }
+#ifdef EXTSTORE
+                    if (it->it_flags & ITEM_HDR) {
+                        if (_get_extstore(c, it, c->iovused-3, 4) != 0) {
+                            item_remove(it);
+                            break;
+                        }
+                    } else if ((it->it_flags & ITEM_CHUNKED) == 0) {
+#else
+                    if ((it->it_flags & ITEM_CHUNKED) == 0) {
+#endif
+                        add_iov(c, ITEM_data(it), it->nbytes);
+                    } else if (add_chunked_item_iovs(c, it, it->nbytes) != 0) {
+                        item_remove(it);
+                        break;
+                    }
+                } else {
+                    MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                                            it->nbytes, ITEM_get_cas(it));
+                    if (add_iov(c, "VALUE ", 6) != 0 || 
+                            add_iov(c, ITEM_key(it), it->nkey) != 0) {
+                        item_remove(it);
+                        break;
+                    }
+                    if ((it->it_flags & ITEM_CHUNKED) == 0) {
+                        if (add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0) {
+                            item_remove(it);
+                            break;
+                        }
+                    } else if (add_iov(c, ITEM_suffix(it), it->nsuffix) != 0 ||
+                                add_chunked_item_iovs(c, it, it->nbytes) != 0) {
+                        item_remove(it);
+                        break;
+                    }
+                }
+
+                if (settings.verbose > 1) {
+                    int ii;
+                    fprintf(stderr, ">%d sending key ", c->sfd);
+                    for (ii = 0; ii < it->nkey; ++ii) {
+                        fprintf(stderr, "%c", key[ii]);
+                    }
+                    fprintf(stderr, "\n");
+                }
+
+                /* item_get() has incremented it->refcount for us */
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                if (should_touch) {
+                    c->thread->stats.touch_cmds++;
+                    c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+                } else {
+                    c->thread->stats.lru_hits[it->slabs_clsid]++;
+                    c->thread->stats.get_cmds++;
+                }
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+#ifdef EXTSTORE
+                /* If ITEM_HDR, an io_wrap owns the reference. */
+                if ((it->it_flags & ITEM_HDR) == 0) {
+                    *(c->ilist + i) = it;
+                    i++;
+                }
+#else
+                *(c->ilist + i) = it;
+                i++;
+#endif
+            } else {
+                pthread_mutex_lock(&c->thread->stats.mutex);
+                if (should_touch) {
+                    c->thread->stats.touch_cmds++;
+                    c->thread->stats.touch_misses++;
+                } else {
+                    c->thread->stats.get_misses++;
+                    c->thread->stats.get_cmds++;
+                }
+                MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
+                pthread_mutex_unlock(&c->thread->stats.mutex);
+            }
+
+            key_token++;
+        }
+
+        /*
+         * If the command string hasn't been fully processed, get the next set
+         * of tokens
+         */
+        if (key_token->value != NULL) {
+            ntokens = tokenize_command(key_token->value, tokens, MAX_TOKENS);
+            key_token = tokens;
+        }
+    
+    } while (key_token->value != NULL);
+
+    c->icurr = c->ilist;
+    c->ileft = i;
+    if (return_cas || !settings.inline_ascii_response) {
+        c->suffixcurr = c->suffixlist;
+        c->suffixleft = si;
+    }
+
+    if (settings.verbose > 1)
+        fprintf(stderr, ">%d END\n", c->sfd);
+
+    /*
+     * If the loop was terminated because of out-of-memory, it is not
+     * reliable to add END\r\n to the buffer, because it might not end
+     * in \r\n. So we send SERVER_ERROR instead.
+     */
+    if (key_token->value != NULL || add_iov(c, "END\r\n", 5) != 0 
+            || (IS_UDP(c->transport) && build_udp_headers(c) != 0)) {
+        out_of_memory(c, "SERVER_ERROR out of memory writing get response");
+    } else {
+        conn_set_state(c, conn_mwrite);
+        c->msgcurr = 0;
+    }
+
+}
+
+static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
+    char *key;
+    size_t nkey;
+    unsigned int flags;
+    int32_t exptime_int = 0;
+    time_t exptime;
+    int vlen;
+    uint64_t req_cas_id = 0;
+    item *it;
+
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
+    if (! (safe_strtoul(tokens[2].value, (uint32_t *)&flags)
+            && safe_strtol(tokens[3].value, &exptime_int)
+            && safe_strtol(tokens[4].value, (int32_t *)&vlen))) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    /* Ubuntu 8.04 breadks when I pass exptime to safe_strtol */
+    exptime = exptime_int;
+
+    /* Negative exptimes can underflow and end up immortal. realtime() will
+     * immediately expire values that are greater than REALTIME_MAXDELTA, but 
+     * less than process_started, so lets aim for that.
+     */
+    if (exptime < 0)
+        exptime = REALTIME_MAXDELTA + 1;
+
+    // does cas value exists?
+    if (handle_cas) {
+        if (!safe_strtoull(tokens[5].value, &req_cas_id)) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+    }
+
+    if (vlen < 0 || vlen > (INT_MAX - 2)) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+    vlen += 2;
+
+    if (settings.detail_enabled) {
+        stats_prefix_record_set(key, nkey);
+    }
+
+    it = item_alloc(key, nkey, flags, realtime(exptime), vlen);
+
+    if (it == 0) {
+        enum store_item_type status;
+        if (! item_size_ok(nkey, flags, vlen)) {
+            out_string(c, "SERVER_ERROR object too large for cache");
+            status = TOO_LARGE;
+        } else {
+            out_of_memory(c, "SERVER_ERROR out of memory storing object");
+            status = NO_MEMORY;
+        }
+        LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
+                NULL, status, comm, key, nkey, 0, 0);
+        /* swallow the data line */
+        c->write_and_go = conn_swallow;
+        c->sbytes = vlen;
+
+        /* Avoid stale data persisting in cache because we failed alloc.
+         * Unacceptable for SET. Anywhere else too? */
+        if (comm == NREAD_SET) {
+            it = item_get(key, nkey, c, DONT_UPDATE);
+            if (it) {
+                item_unlink(it);
+                STORAGE_delete(c->thread->storage, it);
+                item_remove(it);
+            }
+        }
+
+        return;
+    }
+    ITEM_set_cas(it, req_cas_id);
+
+    c->item = it;
+    c->ritem = ITEM_data(it);
+    c->rlbytes = it->nbytes;
+    c->cmd = comm;
+    conn_set_state(c, conn_nread);
+}
+
+static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens) {
+    char *key;
+    size_t nkey;
+    int32_t exptime_int = 0;
+    item *it;
+
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
+    if (!safe_strtol(tokens[2].value, &exptime_int)) {
+        out_string(c, "CLIENT_ERROR invalid exptime argument");
+        return;
+    }
+
+    it = item_touch(key, nkey, realtime(exptime_int), c);
+    if (it) {
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.touch_cmds++;
+        c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        out_string(c, "TOUCHED");
+        item_remove(it);
+    } else {
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.touch_cmds++;
+        c->thread->stats.touch_misses++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        out_string(c, "NOT_FOUND");
+    }
+}
+
+static void process_arithmetic_command(conn *c, token_t *tokens, const size_t ntokens, const bool incr) {
+    char temp[INCR_MAX_STORAGE_LEN];
+    uint64_t delta;
+    char *key;
+    size_t nkey;
+
+    assert(c != NULL);
+
+    set_noreply_maybe(c, tokens, ntokens);
+
+    if (tokens[KEY_TOKEN].length > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
+    if (!safe_strtoull(tokens[2].value, &delta)) {
+        out_string(c, "CLIENT_ERROR invalid numeric delta argument");
+        return;
+    }
+
+    switch (add_delta(c, key, nkey, incr, delta, temp, NULL)) {
+    case OK:
+        out_string(c, temp);
+        break;
+    case NON_NUMERIC:
+        out_string(c, "CLIENT_ERROR cannot increment or decrement non-numeric value");
+        break;
+    case EOM:
+        out_of_memory(c, "SERVER_ERROR out of memory");
+        break;
+    case DELTA_ITEM_NOT_FOUND:
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        if (incr) {
+            c->thread->stats.incr_misses++;
+        } else {
+            c->thread->stats.decr_misses++;
+        }
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        out_string(c, "NOT_FOUND");
+        break;
+    case DELTA_ITEM_CAS_MISMATCH:
+        break;  // Should never get here
+    }
+}
+
+static void process_delete_command(conn *c, token_t *tokens, const size_t ntokens) {
+    char *key;
+    size_t nkey;
+    item *it;
+
+    assert(c != NULL);
+
+    if (ntokens > 3) {
+        bool hold_is_zero = strcmp(tokens[KEY_TOKEN+1].value, "0") == 0;
+        bool sets_noreply = set_noreply_maybe(c, tokens, ntokens);
+        bool valid = (ntokens == 4 && (hold_is_zero || sets_noreply)) 
+          || (ntokens == 5 && hold_is_zero && sets_noreply);
+        if (!valid) {
+            out_string(c, "CLIENT_ERROR bad command line format.  "
+                            "Usage: delete <key> [noreply]");
+            return;
+        }
+    }
+
+    key = tokens[KEY_TOKEN].value;
+    nkey = tokens[KEY_TOKEN].length;
+
+    if (nkey > KEY_MAX_LENGTH) {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    if (settings.detail_enabled) {
+        stats_prefix_record_delete(key, nkey);
+    }
+
+    it = item_get(key, nkey, c, DONT_UPDATE);
+    if (it) {
+        MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
+
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        item_unlink(it);
+        STORAGE_delete(c->thread->storage, it);
+        item_remove(it);        // release our reference
+        out_string(c, "DELETED");
+    } else {
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.delete_misses++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        out_string(c, "NOT_FOUND");
+    }
 }
 
 static void process_command(conn *c, char *command) {
