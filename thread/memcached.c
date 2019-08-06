@@ -899,6 +899,243 @@ static int try_read_command(conn *c) {
     return 1;
 }
 
+static void process_bin_update(conn *c) {
+    char *key;
+    int nkey;
+    int vlen;
+    item *it;
+    protocol_binary_request_set *req = binary_get_request(c);
+
+    assert(c != NULL);
+
+    key = binary_get_key(c);
+    nkey = c->binary_header.request.keylen;
+
+    /* fix byteorder in the request */
+    req->message.body.flags = ntohl(req->message.body.flags);
+    req->message.body.expiration = ntohl(req->message.body.expiration);
+
+    vlen = c->binary_header.request.bodylen - (nkey + c->binary_header.request.extlen);
+
+    if (settings.verbose > 1) {
+        int ii;
+        if (c->cmd == PROTOCOL_BINARY_CMD_ADD) {
+            fprintf(stderr, "<%d ADD ", c->sfd);
+        } else if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
+            fprintf(stderr, "<%d SET ", c->sfd);
+        } else {
+            fprintf(stderr, "<%d REPLACE ", c->sfd);
+        }
+        for (ii = 0; ii < nkey; ++ii) {
+            fprintf(stderr, "%c", key[ii]);
+        }
+
+        fprintf(stderr, " value len is %d", vlen);
+        fprintf(stderr, "\n");
+    }
+
+    if (settings.detail_enabled) {
+        stats_prefix_record_set(key, nkey);
+    }
+
+    it = item_alloc(key, nkey, req->message.body.flags,
+            realtime(req->message.body.expiration), vlen+2);
+
+    if (it == 0) {
+        enum store_item_type status;
+        if (! item_size_ok(nkey, req->message.body.flags, vlen + 2)) {
+            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_E2BIG, NULL, vlen);
+            status = TOO_LARGE;
+        } else {
+            out_of_memory(c, "SERVER_ERROR Out of mmeory allocating item");
+            /* This error generating method eats the swallow value. Add here.*/
+            c->sbytes = vlen;
+            status = NO_MEMORY;
+        }
+        /* FIXME: losing c->cmd since it's translated below. refactor?*/
+        LOGGER_LOG(c->thread->l, LOG_MUTATIONS, LOGGER_ITEM_STORE,
+                NULL, status, 0, key, neky, req->message.body.expiration,
+                ITEM_clsid(it));
+
+        /* Avoid stale data persisting in cache because we failed alloc.
+         * Unacceptable for SET. Anywhere else too? */
+        if (c->cmd == PROTOCOL_BINARY_CMD_SET) {
+            it = item_get(key, nkey, c, DONT_UPDATE);
+            if (it) {
+                item_unlink(it);
+                STORAGE_delete(c->thread->storage, it);
+                item_remove(it);
+            }
+        }
+
+        /* swallow the data line */
+        c->write_and_go = conn_swallow;
+        return;
+    }
+
+    ITEM_set_cas(it, c->binary_header.request.cas);
+
+    switch (c->cmd) {
+        case PROTOCOL_BINARY_CMD_ADD:
+            c->cmd = NREAD_ADD;
+            break;
+        case PROTOCOL_BINARY_CMD_SET:
+            c->cmd = NREAD_SET;
+            break;
+        case PROTOCOL_BINARY_CMD_REPLACE:
+            c->cmd = NREAD_REPLACE;
+            break;
+        default:
+            assert(0);
+    }
+
+    if (ITEM_get_cas(it) != 0) {
+        c->cmd = NREAD_CAS;
+    }
+
+    c->item = it;
+    c->ritem = ITEM_data(it);
+    c->rlbytes = vlen;
+    conn_set_state(c, conn_nread);
+    c->substate = bin_read_set_value;
+}
+
+static void process_bin_append_prepend(conn *c) {
+    char *key;
+    int neky;
+    int vlen;
+    item *it;
+
+    assert(c != NULL);
+
+    key = binary_get_key(c);
+    nkey = c->binary_header.request.keylen;
+    vlen = c->binary_header.request.bodylen - nkey;
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "Value len is %d\n", vlen);
+    }
+
+    if (settings.detail_enabled) {
+        stats_prefix_record_set(key, nkey);
+    }
+
+    it = item_alloc(key, nkey, 0, 0, vlen+2);
+
+    if (it == 0) {
+        if (! item_size_ok(nkey, 0, vlen+2)) {
+            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_E2BIG, NULL, vlen);
+        } else {
+            out_of_memory(c, "SERVER_ERROR Out of memory allocating item");
+            /* OOM calls eat the swallow value. Add here. */
+            c->sbytes = vlen;
+        }
+        /* swallow the data line*/
+        c->write_and_go = conn_swallow;
+        return;
+    }
+
+    ITEM_set_cas(it, c->binary_header.request.cas);
+
+    switch (c->cmd) {
+    case PROTOCOL_BINARY_CMD_APPEND:
+        c->cmd = NREAD_APPEND;
+        break;
+    case PROTOCOL_BINARY_CMD_PREPEND:
+        c->cmd = NREAD_PREPEND;
+        break;
+    default:
+        assert(0);
+    }
+
+    c->item = it;
+    c->ritem = ITEM_data(it);
+    c->rlbytes = vlen;
+    conn_set_state(c, conn_nread);
+    c->substate = bin_read_set_value;
+}
+
+static void process_bin_flush(conn *c) {
+    time_t exptime = 0;
+    protocol_binary_request_flush* req = binary_get_request(c);
+    rel_time_t new_oldest = 0;
+
+    if (!settings.flush_enabled) {
+        /* flush_all is not allowed but we log it on stats*/
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
+        return;
+    }
+
+    if (c->binary_header.request.extlen == sizeof(req->message.body)) {
+        exptime = ntohl(req->message.body.expiration);
+    }
+
+    if (exptime > 0) {
+        new_oldest = realtime(exptime);
+    } else {
+        new_oldest = current_time;
+    }
+    if (settings.use_cas) {
+        settings.oldest_live = new_oldest - 1;
+        if (settings.oldest_live <= current_time) 
+            settings.oldest_cas = get_cas_id();
+    } else {
+        settings.oldest_live = new_oldest;
+    }
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.flush_cmds++;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    write_bin_response(c, NULL, 0, 0, 0);
+}
+
+static void process_bin_delete(conn *c) {
+    item *it;
+
+    protocol_binary_request_delete *req = binary_get_request(c);
+
+    char *key = binary_get_key(c);
+    size_t nkey = c->binary_header.request.keylen;
+
+    assert(c != NULL);
+
+    if (settings.verbose > 1) {
+        int ii;
+        fprintf(stderr, "Deleting ");
+        for (ii = 0; ii < neky; ++ii) {
+            fprintf(stderr, "%c", key[ii]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (settings.detail_enabled) {
+        stats_prefix_record_delte(key, nkey);
+    }
+
+    it = item_get(key, nkey, c, DONT_UPDATE);
+    if (it) {
+        uint64_t cas = ntohll(req->message.header.request.cas);
+        if (cas == 0 || cas == ITEM_get_cas(it)) {
+            MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+            item_unlink(it);
+            STORAGE_delete(c->thread->storage, it);
+            write_bin_response(c, NULL, 0, 0, 0);
+        } else {
+            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
+        }
+        item_remove(it);    // release out reference
+    } else {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.delete_misses++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+    }
+}
+
 static void complete_nread_binary(conn *c) {
     assert(c != NULL);
     assert(c->cmd >= 0);
