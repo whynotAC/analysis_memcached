@@ -458,14 +458,530 @@ static void write_bin_response(conn *c, void *d, int hlen, int keylen, int dlen)
     }
 }
 
-/* Just write an error message and disconnect the client */
-static void handle_binary_protocol_error(conn *c) {
-    write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, 0);
-    if (settings.verbose) {
-        fprintf(stderr, "Protocol error (opcode %02x), close connection %d\n",
-                    c->binary_header.request.opcode, c->sfd);
+static void complete_incr_bin(conn *c) {
+    item *it;
+    char *key;
+    size_t nkey;
+    /* Weird magic in add_delta forces me to pad here */
+    char tmpbuf[INCR_MAX_STORAGE_LEN];
+    uint64_t cas = 0;
+
+    protocol_binary_response_incr* rsp = (protocol_binary_response_incr*)c->wbuf;
+    protocol_binary_request_incr* req = binary_get_request(c);
+
+    assert(c != NULL);
+    assert(c->wsize >= sizeof(*rsp));
+
+    /* fix byteorder in the request */
+    req->message.body.delta = ntohll(req->message.body.delta);
+    req->message.body.initial = ntohll(req->message.body.initial);
+    req->message.body.expiration = ntohl(req->message.body.expiration);
+    key = binary_get_key(c);
+    nkey = c->binary_header.request.keylen;
+
+    if (settings.verbose > 1) {
+        int i;
+        fprintf(stderr, "incr ");
+
+        for (i = 0; i < nkey; i++) {
+            fprintf(stderr, "%c", key[i]);
+        }
+        fprintf(stderr, " %lld, %llu, %d\n",
+                (long long)req->message.body.delta,
+                (long long)req->message.body.initial,
+                req->message.body.expiration);
     }
-    c->write_and_go = conn_closing;
+
+    if (c->binary_header.request.cas != 0) {
+        cas = c->binary_header.request.cas;
+    }
+    switch (add_delta(c, key, nkey, c->cmd == PROTOCOL_BINARY_CMD_INCREMENT,
+                        req->message.body.delta, tmpbuf,
+                        &cas)) {
+    case OK:
+        rsp->message.body.value = htonll(strtoull(tmpbuf, NULL, 10));
+        if (cas) {
+            c->cas = cas;
+        }
+        write_bin_response(c, &rsp->message.body, 0, 0, 
+                    sizeof(rsp->message.body.value));
+        break;
+    case NON_NUMERIC:
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_DELTA_BADVAL, NULL, 0);
+        break;
+    case EOM:
+        out_of_memory(c, "SERVER_ERROR Out of memory incrementing value");
+        break;
+    case DELTA_ITEM_NOT_FOUND:
+        if (req->message.body.expiration != 0xffffffff) {
+            /* Save some room for the response */
+            rsp->message.body.value = htonll(req->message.body.initial);
+
+            snprintf(tmpbuf, INCR_MAX_STORAGE_LEN, "%llu",
+                    (unsigned long long)req->message.body.initial);
+            int res = strlen(tmpbuf);
+            it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration), 
+                            res + 2);
+            if (it != NULL) {
+                memcpy(ITEM_data(it), tmpbuf, res);
+                memcpy(ITEM_data(it) + res, "\r\n", 2);
+
+                if (store_item(it, NREAD_ADD, c)) {
+                    c->cas = ITEM_get_cas(it);
+                    write_bin_response(c, &rsp->message.body, 0, 0, sizeof(rsp->message.body.value));
+                } else {
+                    write_bin_error(c, PROTOCOL_BINARY_RESPONSE_NOT_STORED, NULL, 0);
+                }
+                item_remove(it);        // release out reference
+            } else {
+                out_of_memory(c, "SERVER_ERROR Out of memory allocating new item");
+            }
+        } else {
+            pthread_mutex_lock(&c->thread->stats.mutex);
+            if (c->cmd == PROTOCOL_BINARY_CMD_INCREMENT) {
+                c->thread->stats.incr_misses++;
+            } else {
+                c->thread->stats.decr_misses++;
+            }
+            pthread_mutex_unlock(&c->thread->stats.mutex);
+
+            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
+        }
+        break;
+    case DELTA_ITEM_CAS_MISMATCH:
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
+        break;
+    }
+}
+
+static void complete_update_bin(conn *c) {
+    protocol_binary_response_status eno = PROTOCOL_BINARY_RESPONSE_EINVAL;
+    enum store_item_type ret = NOT_STORED;
+    assert (c != NULL);
+
+    item *it = c->item;
+
+    pthread_mutex_lock(&c->thread->stats.mutex);
+    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
+    pthread_mutex_unlock(&c->thread->stats.mutex);
+
+    /* We don't actually receive the trailing two characters in the bin
+     * protocol, so we're going to just set them here */
+    if ((it->it_flags & ITEM_CHUNKED) == 0) {
+        *(ITEM_data(it) + it->nbytes - 2) = '\r';
+        *(ITEM_data(it) + it->nbytes - 1) = '\n';
+    } else {
+        assert(c->ritem);
+        item_chunk *ch = (item_chunk *)c->ritem;
+        if (ch->size == ch->used)
+            ch = ch->next;
+        assert(ch->size - ch->used >= 2);
+        ch->data[ch->used] = '\r';
+        ch->data[ch->used + 1] = '\n';
+        ch->used += 2;
+    }
+
+    ret = store_item(it, c->cmd, c);
+
+#ifdef ENABLE_DTRACE
+    uint64_t cas = ITEM_get_cas(it);
+    switch (c->cmd) {
+    case NREAD_ADD:
+        MEMCACHED_COMMAND_ADD(c->sfd, ITEM_key(it), it->nkey,
+                                (ret == STORED) ? it->nbytes : -1, cas);
+        break;
+    case NREAD_REPLACE:
+        MEMCACHED_COMMAND_REPLACE(c->sfd, ITEM_key(it), it->nkey,
+                                    (ret == STORED) ? it->nbytes : -1, cas);
+        break;
+    case NREAD_APPEND:
+        MEMCACHED_COMMAND_APPEND(c->sfd, ITEM_key(it), it->nkey,
+                                    (ret == STORED) ? it->nbytes : -1, cas);
+        break;
+    case NREAD_PREPEND:
+        MEMCACHED_COMMAND_PREPEND(c->sfd, ITEM_key(it), it->nkey,
+                                    (ret == STORED) ? it->nbytes : -1, cas);
+        break;
+    case NREAD_SET:
+        MEMCACHED_COMMAND_SET(c->sfd, ITEM_key(it), it->nkey, 
+                                (ret == STORED) ? it->nbytes : -1, cas);
+        break;
+    }
+#endif
+
+    switch (ret) {
+    case STORED:
+        /* Stored */
+        write_bin_response(c, NULL, 0, 0, 0);
+        break;
+    case EXISTS:
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
+        break;
+    case NOT_FOUND:
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
+        break;
+    case NOT_STORED:
+    case TOO_LARGE:
+    case NO_MEMORY:
+        if (c->cmd == NREAD_ADD) {
+            eno = PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS;
+        } else if (c->cmd == NREAD_REPLACE) {
+            eno = PROTOCOL_BINARY_RESPONSE_KEY_ENOENT;
+        } else {
+            eno = PROTOCOL_BINARY_RESPONSE_NOT_STORED;
+        }
+        write_bin_error(c, eno, NULL, 0);
+    }
+
+    item_remove(c->item);       // release the c->item reference
+    c->item = 0;
+}
+
+static void write_bin_miss_response(conn *c, char *key, size_t nkey) {
+    if (nkey) {
+        char *ofs = c->wbuf + sizeof(protocol_binary_response_header);
+        add_bin_header(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0, nkey, nkey);
+        memcpy(ofs, key, nkey);
+        add_iov(c, ofs, nkey);
+        conn_set_state(c, conn_mwrite);
+        c->write_and_go = conn_new_cmd;
+    } else {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
+    }
+}
+
+static void process_bin_get_or_touch(conn *c) {
+    item *it;
+
+    protocol_binary_response_get* rsp = (protocol_binary_request_get*)c->wbuf;
+    char *key = binary_get_key(c);
+    size_t nkey = c->binary_header.request.keylen;
+    int should_touch = (c->cmd == PROTOCOL_BINARY_CMD_TOUCH ||
+                        c->cmd == PROTOCOL_BINARY_CMD_GAT ||
+                        c->cmd == PROTOCOL_BINARY_CMD_GATK);
+    int should_return_key = (c->cmd == PROTOCOL_BINARY_CMD_GETK ||
+                             c->cmd == PROTOCOL_BINARY_CMD_GATK);
+    int should_return_value = (c->cmd != PROTOCOL_BINARY_CMD_TOUCH);
+    bool failed = false;
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "<%d %s ", c->sfd, should_touch ? "TOUCH" : "GET");
+        if (fwrite(key, 1, nkey, stderr)) {}
+        fputc('\n', stderr);
+    }
+
+    if (should_touch) {
+        protocol_binary_request_touch *t = binary_get_request(c);
+        time_t exptime = ntohl(t->message.body.expiration);
+
+        it = item_touch(key, nkey, realtime(exptime), c);
+    } else {
+        it = item_get(key, nkey, c, DO_UPDATE);
+    }
+
+    if (it) {
+        /* the length has two unnecessary bytes ("\r\n") */
+        uint16_t keylen = 0;
+        uint32_t bodylen = sizeof(rsp->message.body) + (it->nbytes - 2);
+
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        if (should_touch) {
+            c->thread->stats.touch_cmds++;
+            c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
+        } else {
+            c->thread->stats.get_cmds++;
+            c->thread->stats.lru_hits[it->slabs_clsid]++;
+        }
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        if (should_touch) {
+            MEMCACHED_COMMAND_TOUCH(c->sfd, ITEM_key(it), it->nkey,
+                                    it->nbytes, ITEM_get_cas(it));
+        } else {
+            MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                                    it->nbytes, ITEM_get_cas(it));
+        }
+
+        if (c->cmd == PROTOCOL_BINARY_CMD_TOUCH) {
+            bodylen -= it->nbytes - 2;
+        } else if (should_return_key) {
+            bodylen += nkey;
+            keylen = nkey;
+        }
+
+        add_bin_header(c, 0, sizeof(rsp->message.body), keylen, bodylen);
+        rsp->message.header.response.cas = htonll(ITEM_get_cas(it));
+
+        // add the flags
+        if (settings.inline_ascii_response) {
+            rsp->message.body.flags = htonl(strtoul(ITEM_suffix(it), NULL, 10));
+        } else if (it->nsuffix > 0) {
+            rsp->message.body.flags = htonl(*((uint32_t *)ITEM_suffix(it)));
+        } else {
+            rsp->message.body.flags = 0;
+        }
+        add_iov(c, &rsp->message.body, sizeof(rsp->message.body));
+
+        if (should_return_key) {
+            add_iov(c, ITEM_key(it), nkey);
+        }
+
+        if (should_return_value) {
+            /* Add the data minus the CRLF */
+#ifdef EXTSTORE
+            if (it->it_flags & ITEM_HDR) {
+                int iovcnt = 4;
+                int iovst = c->iovused - 3;
+                if (!should_return_key) {
+                    iovcnt = 3;
+                    iovst = c->iovused - 2;
+                }
+                // FIXME: this can return an error, but code flow doesn't
+                // allow bailing here.
+                if (_get_extstore(c, it, iovst, iovcnt) != 0)
+                    failed = true;
+            } else if ((it->it_flags & ITEM_CHUNKED) == 0) {
+                add_iov(c, ITEM_data(it), it->nbytes - 2);
+            } else {
+                add_chunked_item_iovs(c, it, it->nbytes - 2);
+            }
+#else
+            if ((it->it_flags & ITEM_CHUNKED) == 0) {
+                add_iov(c, ITEM_data(it), it->nbytes - 2);
+            } else {
+                add_chunked_item_iovs(c, it, it->nbytes - 2);
+            }
+#endif
+        }
+
+        if (!failed) {
+            conn_set_state(c, conn_mwrite);
+            c->write_and_go = conn_new_cmd;
+            /* Remember this command so we can garbage collect it later */
+#ifdef EXTSTORE
+            if ((it->it_flags & ITEM_HDR) != 0 && should_return_value) {
+                // Only have extstore clean if header and returning value.
+                c->item = NULL;
+            } else {
+                c->item = it;
+            }
+#else
+            c->item = it;
+#endif
+       } else {
+            item_remove(it);
+       }
+    } else {
+        failed = true;
+    }
+
+    if (failed) {
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        if (should_touch) {
+            c->thread->stats.touch_cmds++;
+            c->thread->stats.touch_misses++;
+        } else {
+            c->thread->stats.get_cmds++;
+            c->thread->stats.get_misses++;
+        }
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+
+        if (should_touch) {
+            MEMCACHED_COMMAND_TOUCH(c->sfd, key, nkey, -1, 0);
+        } else {
+            MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
+        }
+
+        if (c->noreply) {
+            conn_set_state(c, conn_new_cmd);
+        } else {
+            if (should_return_key) {
+                write_bin_miss_response(c, key, nkey);
+            } else {
+                write_bin_miss_response(c, NULL, 0);
+            }
+        }
+    }
+
+    if (settings.detail_enabled) {
+        stats_prefix_record_get(key, nkey, NULL != it);
+    }
+}
+
+static void append_bin_stats(const char *key, const uint16_t keln,
+                                const char *val, const uint32_t vlen,
+                                conn *c) {
+    char *buf = c->stats.buffer + c->stats.offset;
+    uint32_t bodylen = klen + vlen;
+    protocol_binary_response_header header = {
+        .response.magic = (uint8_t)PROTOCOL_BINARY_RES,
+        .response.opcode = PROTOCOL_BINARY_CMD_STAT,
+        .response.keylen = (uint16_t)htons(klen),
+        .response.datatype = (uint8_t)PROTOCOL_BINARY_RAW_BYTES,
+        .response.bodylen = htonl(bodylen),
+        .response.opaque = c->opaque
+    };
+
+    memcpy(buf, header.bytes, sizeof(header.response));
+    buf += sizeof(header.response);
+
+    if (klen > 0) {
+        memcpy(buf, key, klen);
+        buf += klen;
+
+        if (vlen > 0) {
+            memcpy(buf, val, vlen);
+        }
+    }
+
+    c->stats.offset += sizeof(header.response) + bodylen;
+}
+
+static void append_ascii_stats(const char *key, const uint16_t klen,
+                                const char *val, const uint32_t vlen,
+                                conn *c) {
+    char *pos = c->stats.buffer + c->stats.offset;
+    uint32_t nbytes = 0;
+    int remaining = c->stats.size - c->stats.offset;
+    int room = remaining - 1;
+
+    if (klen == 0 && vlen == 0) {
+        nbytes = snprintf(pos, room, "END\r\n");
+    } else if (vlen == 0) {
+        nbytes = snprintf(pos, room, "STAT %s\r\n", key);
+    } else {
+        nbytes = snprintf(pos, room, "STAT %s %s\r\n", key, val);
+    }
+
+    c->stats.offset += nbytes;
+}
+
+static bool grow_stats_buf(conn *c, size_t needed) {
+    size_t nsize = c->stats.size;
+    size_t available = nsize - c->stats.offset;
+    bool rv = true;
+
+    /* Spectial case: No buffer -- need to allocate fresh */
+    if (c->stats.buffer == NULL) {
+        nsize = 1024;
+        available = c->stats.size = c->stats.offset = 0;
+    }
+
+    while (needed > available) {
+        assert(nsize > 0);
+        nsize = nsize << 1;
+        available = nsize - c->stats.offset;
+    }
+
+    if (nsize != c->stats.size) {
+        char* ptr = realloc(c->stats.buffer, nsize);
+        if (ptr) {
+            c->stats.buffer = ptr;
+            c->stats.size = nsize;
+        } else {
+            STATS_LOCK();
+            stats.malloc_fails++;
+            STATS_UNLOCK();
+            rv = false;
+        }
+    }
+
+    return rv;
+}
+
+static void append_stats(const char *key, const uint16_t klen,
+                            const char *val, const uint32_t vlen,
+                            const void *cookie) {
+    /* value without a key is invalid */
+    if (klen == 0 && vlen > 0) {
+        return ;
+    }
+
+    conn *c = (conn *)cookie;
+
+    if (c->protocol == binary_prot) {
+        size_t needed = vlen + klen + sizeof(protocol_binary_response_header);
+        if (!grow_stats_buf(c, needed)) {
+            return ;
+        }
+        append_bin_stats(key, klen, val, vlen, c);
+    } else {
+        size_t needed = vlen + klen + 10;   // 10 == "STAT = \r\n"
+        if (!grow_stats_buf(c, needed)) {
+            return ;
+        }
+        append_ascii_stats(key, klen, val, vlen, c);
+    }
+
+    assert(c->stats.offset <= c->stats.size);
+}
+
+static void process_bin_stat(conn *c) {
+    char *subcommand = binary_get_key(c);
+    size_t nkey = c->binary_header.request.keylen;
+
+    if (settings.verbose > 1) {
+        int ii;
+        fprintf(stderr, "<%d STATS ", c->sfd);
+        for (ii = 0; ii < nkey; ++ii) {
+            fprintf(stderr, "%c", subcommand[ii]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (nkey == 0) {
+        /* request all statistics */
+        server_stats(&append_stats, c);
+        (void)get_stats(NULL, 0, &append_stats, c);
+    } else if (strncmp(subcommand, "reset", 5) == 0) {
+        stats_reset();
+    } else if (strncmp(subcommand, "settings", 8) == 0) {
+        process_stats_settings(&append_stats, c);
+    } else if (strncmp(subcommand, "detail", 6) == 0) {
+        char *subcmd_pos = subcommand + 6;
+        if (strncmp(subcmd_pos, "dump", 5) == 0) {
+            int len;
+            char *dump_buf = stats_prefix_dump(&len);
+            if (dump_buf == NULL || len <= 0) {
+                out_of_memory(c, "SERVER_ERROR Out of memory generating stats");
+                if (dump_buf != NULL)
+                    free(dump_buf);
+                return;
+            } else {
+                append_stats("detailed", strlen("detailed"), dump_buf, len, c);
+                free(dump_buf);
+            }
+        } else if (strncmp(subcmd_pos, " on", 3) == 0) {
+            settings.detail_enabled = 1;
+        } else if (strncmp(subcmd_pos, " off", 4) == 0) {
+            settings.detail_enabled = 0;
+        } else {
+            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENENT, NULL, 0);
+            return ;
+        }
+    } else {
+        if (get_stats(subcommand, nkey, &append_stats, c)) {
+            if (c->stats.buffer == NULL) {
+                out_of_memory(c, "SERVER_ERROR Out of memory generating stats");
+            } else {
+                write_and_free(c, c->stats.buffer, c->stats.offset);
+                c->stats.buffer = NULL;
+            }
+        } else {
+            write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
+        }
+
+        return;
+    }
+
+    /* Append termination package and start the transfer */
+    append_stats(NULL, 0, NULL, 0, c);
+    if (c->stats.buffer == NULL) {
+        out_of_memory(c, "SERVER_ERROR Out of memory preparing to send stats");
+    } else {
+        write_and_free(c, c->stats.buffer, c->stats.offset);
+        c->stats.buffer = NULL;
+    }
 }
 
 static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
@@ -520,6 +1036,16 @@ static void bin_read_key(conn *c, enum bin_substates next_substate, int extra) {
     conn_set_state(c, conn_nread);
 }
 
+/* Just write an error message and disconnect the client */
+static void handle_binary_protocol_error(conn *c) {
+    write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, 0);
+    if (settings.verbose) {
+        fprintf(stderr, "Protocol error (opcode %02x), close connection %d\n",
+                    c->binary_header.request.opcode, c->sfd);
+    }
+    c->write_and_go = conn_closing;
+}
+
 static void init_sasl_conn(conn *c) {
     assert(c);
     /* should something else be returned? */
@@ -570,6 +1096,159 @@ static void bin_list_sasl_mechs(conn *c) {
         return;
     }
     write_bin_response(c, (char *)result_string, 0, 0, string_length);
+}
+
+static void process_bin_sasl_auth(conn *c) {
+    // Guard for handing disabled SASL on the server.
+    if (!settings.sasl) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_UNKNOWN_COMMAND, NULL,
+                        c->binary_header.request.bodylen - 
+                        c->binary_header.request.keylen);
+        return;
+    }
+
+    assert(c->binary_header.request.extlen == 0);
+
+    int neky = c->binary_header.request.keylen;
+    int vlen = c->binary_header.request.bodylen - nkey;
+
+    if (nkey > MAX_SASL_MECH_LEN) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
+        c->write_and_go = conn_swallow;
+        return;
+    }
+
+    char *key = binary_get_key(c);
+    assert(key);
+
+    item *it = item_alloc(key, nkey, 0, 0, vlen+2);
+
+    /* Can't use a chunked item for SASL authentication. */
+    if (it == 0 || (it->it_flags & ITEM_CHUNKED)) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, NULL, vlen);
+        c->write_and_go = conn_swallow;
+        return;
+    }
+
+     c->item = it;
+     c->ritem = ITEM_data(it);
+     c->rlbytes = vlen;
+     conn_set_state(c, conn_nread);
+     c->substats = bin_reading_sasl_auth_data;
+}
+
+static void process_bin_complete_sasl_auth(conn *c) {
+    assert(settings.sasl);
+    const char *out = NULL;
+    unsigned int outlen = 0;
+
+    assert(c->item);
+    init_sasl_conn(c);
+
+    int nkey = c->binary_header.request.keylen;
+    int vlen = c->binary_header.request.bodylen - nkey;
+
+    if (nkey > ((item*) c->item)->nkey) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
+        c->write_and_go = conn_swallow;
+        item_unlink(c->item);
+        return;
+    }
+
+     char mech[nkey+1];
+     memcpy(mech, ITEM_key((item*)c->item), nkey);
+     mech[nkey] = 0x00;
+
+     if (settings.verbose)
+        fprintf(stderr, "mech:  ``%s'' with %d bytes of data\n", mech, vlen);
+
+     const char *challenge = vlen == 0 ? NULL : ITEM_data((item*) c->item);
+
+     if (vlen > ((item*) c->item)->nbytes) {
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_EINVAL, NULL, vlen);
+        c->write_and_go = conn_swallow;
+        item_unlink(c->item);
+        return;
+     }
+
+     int result = -1;
+
+     switch (c->cmd) {
+     case PROTOCOL_BINARY_CMD_SASL_AUTH:
+        result = sasl_server_start(c->sasl_conn, mech, challenge, vlen,
+                                        &out, &outlen);
+        break;
+     case PROTOCOL_BINARY_CMD_SASL_STEP:
+        result = sasl_server_step(c->sasl_conn,
+                                    challenge, vlen,
+                                    &out, &outlen);
+        break;
+     default:
+        assert(false);  // CMD should be one of the above.
+        /* This code is pretty much impossible, but makes the compiler
+         * happier
+         * */
+        if (settings.verbose) {
+            fprintf(stderr, "Unhandled command %d with challenge %s\n",
+                        c->cmd, challenge);
+        }
+        break;
+     }
+
+     item_unlink(c->item);
+
+     if (settings.verbose) {
+        fprintf(stderr, "sasl result code: %d\n", result);
+     }
+
+     switch (result) {
+     case SASL_OK:
+        c->authenticated = true;
+        write_bin_response(c, "Authenticated", 0, 0, strlen("Authenticated"));
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.auth_cmds++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+        break;
+     case SASL_CONTINUE:
+        add_bin_header(c, PROTOCOL_BINARY_RESPONSE_AUTH_CONTINUE, 0, 0, outlen);
+        if (outlen > 0) {
+            add_iov(c, out, outlen);
+        }
+        conn_set_state(c, conn_mwrite);
+        c->write_and_go = conn_new_cmd;
+        break;
+     default:
+        if (settings.verbose)
+            fprintf(stderr, "Unknown sasl response: %d\n", result);
+        write_bin_error(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, NULL, 0);
+        pthread_mutex_lock(&c->thread->stats.mutex);
+        c->thread->stats.auth_cmds++;
+        c->thread->stats.auth_errors++;
+        pthread_mutex_unlock(&c->thread->stats.mutex);
+     }
+}
+
+static bool authenticated(conn *c) {
+    assert(settings.sasl);
+    bool rv = false;
+
+    switch (c->cmd) {
+    case PROTOCOL_BINARY_CMD_SASL_LIST_MECHS:   // FALLTHROUGH
+    case PROTOCOL_BINARY_CMD_SASL_AUTH:
+    case PROTOCOL_BINARY_CMD_SASL_STEP:
+    case PROTOCOL_BINARY_CMD_VERSION:
+      rv = true;
+      break;
+    default:
+      rv = c->authenticated;
+    }
+
+    if (settings.verbose > 1) {
+        fprintf(stderr, "authenticated() in cmd 0x%02x is %s\n",
+                c->cmd, rv ? "true" : "false");
+    }
+
+    return rv;
 }
 
 static void dispatch_bin_command(conn *c) {
@@ -1163,7 +1842,7 @@ static void complete_nread_binary(conn *c) {
         process_bin_delete(c);
         break;
     case bin_reading_incr_header:
-        process_incr_bin(c);
+        complete_incr_bin(c);
         break;
     case bin_read_flush_exptime:
         process_bin_flush(c);
