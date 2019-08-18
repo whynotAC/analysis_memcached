@@ -426,4 +426,230 @@ static void _storage_compact_cb(void *e, obj_io *io, int ret) {
     pthread_mutex_unlock(&wrap->lock);
 }
 
+// TODO: hoist the storage bits from lru_maintainer_thread in here.
+// would be nice if they could avoid hammering the same locks though?
+// I guess it's only COLD. that's probably fine.
+static void *storage_compact_thread(void *arg) {
+    void *storage = arg;
+    useconds_t to_sleep = MAX_STORAGE_COMPACT_SLEEP;
+    bool compacting = false;
+    uint64_t page_version = 0;
+    uint64_t page_size = 0;
+    uint64_t page_offset = 0;
+    uint32_t page_id = 0;
+    bool drop_unread = false;
+    char *readback_buf = NULL;
+    struct storage_compact_wrap wrap;
+
+    logger *l = logger_create();
+    if (l == NULL) {
+        fprintf(stderr, "Failed to allocate logger for storage compaction thread\n");
+        abort();
+    }
+
+    readback_buf = malloc(settings.ext_wbuf_size);
+    if (readback_buf == NULL) {
+        fprintf(stderr, "Failed to allocate readback buffer for storage compaction thread\n");
+        abort();
+    }
+
+    pthread_mutex_init(&wrap.lock, NULL);
+    wrap.done = false;
+    wrap.shumitted = false;
+    wrap.io.data = &wrap;
+    wrap.io.buf = (void *)readback_buf;
+
+    wrap.io.len = settings.ext_wbuf_size;
+    wrap.io.mode = OBJ_IO_READ;
+    wrap.io.cb = _storage_compact_cb;
+    pthread_mutex_lock(&storage_compact_plock);
+
+    while (1) {
+        pthread_mutex_unlock(&storage_compact_plock);
+        if (to_sleep) {
+            extstore_run_maint(storage);
+            usleep(to_sleep);
+        }
+        pthread_mutex_lock(&storage_compact_plock);
+
+        if (!compacting && storage_compact_check(storage, l,
+                &page_id, &page_version, &page_size, &drop_unread)) {
+            page_offset = 0;
+            compacting = true;
+            LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_COMPACT_START,
+                    NULL, page_id, page_version);
+        }
+
+        if (compacting) {
+            pthread_mutex_lock(&wrap.lock);
+            if (page_offset < page_size && !wrap.done && !wrap.submitted) {
+                wrap.io.page_version = page_version;
+                wrap.io.page_id = page_id;
+                wrap.io.offset = page_offset;
+                // FIXME: should be smarter about io->next (unlink at use?)
+                wrap.io.next = NULL;
+                wrap.submitted = true;
+                wrap.miss = false;
+
+                extstore_submit(storage, &wrap.io);
+            } else if (wrap.miss) {
+                LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_COMPACT_ABORT,
+                        NULL, page_id);
+                wrap.done = false;
+                wrap.submitted = false;
+                compacting = false;
+            } else if (wrap.submitted && wrap.done) {
+                LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_COMPACT_READ_START,
+                        NULL, page_id, page_offset);
+                storage_compact_readback(storage, l, drop_unread,
+                        readback_buf, page_id, page_version, settings.ext_wbuf_size);
+                page_offset += settings.ext_wbuf_size;
+                wrap.done = false;
+                wrap.submitted = false;
+            } else if (page_offset >= page_size) {
+                compacting = false;
+                wrap.done = false;
+                wrap.submitted = false;
+                extstore_close_page(storage, page_id, page_version);
+                LOGGER_LOG(l, LOG_SYSEVENTS, LOGGER_COMPACT_END,
+                    NULL, page_id);
+            }
+            pthread_mutex_unlock(&wrap.lock);
+
+            if (to_sleep > MIN_STORAGE_COMPACT_SLEEP)
+                to_sleep /= 2;
+        } else {
+            if (to_sleep < MAX_STORAGE_COMPACT_SLEEP)
+                to_sleep += MIN_STORAGE_COMPACT_SLEEP;
+        }
+    }
+    free(readback_buf);
+
+    return NULL;
+}
+
+// TODO
+// logger needs logger_destroy() to exist/work before this is safe.
+/*
+ * int stop_storage_compact_thread(void) {
+ *      int ret;
+ *      pthread_mutex_lock(&lru_maintainer_lock);
+ *      do_run_lru_maintainer_thread = 0;
+ *      pthread_mutex_unlock(&lru_maintainer_lock);
+ *      if ((ret = pthread_join(lru_maintainer_tid, NULL)) != 0) {
+ *          fprintf(stderr, "Failed to stop LRU maintainer thread: %s\n",
+ *              strerror(ret));
+ *          return -1;
+ *      }
+ *      settings.lru_maintainer_thread = false;
+ *      return 0;
+ * }
+ */
+
+void storage_compact_pause(void) {
+    pthread_mutex_lock(&storage_compact_plock);
+}
+
+void storage_compact_resume(void) {
+    pthread_mutex_unlock(&storage_compact_plock);
+}
+
+int start_storage_compact_thread(void *arg) {
+    int ret;
+
+    pthread_mutex_init(&storage_compact_plock, NULL);
+    if ((ret = pthread_create(&storage_compact_tid, NULL,
+            storage_compact_thread, arg)) != 0) {
+        fprintf(stderr, "Can't create storage_compact thread: %s\n",
+            strerror(ret));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*** UTILITY ***/
+// /path/to/file:100G:bucket1
+// FIXME: Modifies argument. copy instead?
+struct extstore_conf_file *storage_conf_parse(char *arg, unsigned int page_size) {
+    struct extstore_conf_file *cf = NULL;
+    char *b = NULL;
+    char *p = strtok_r(arg, ":", &b);
+    char unit = 0;
+    uint64_t multiplier = 0;
+    int base_size = 0;
+    if (p == NULL)
+        goto error;
+    // First arg is the filepath
+    cf = calloc(1, sizeof(struct extstore_conf_file));
+    cf->file = strdup(p);
+
+    p = strtok_r(NULL, ":", &b);
+    if (p == NULL) {
+        fprintf(stderr, "must supply size to ext_path, ie: ext_path=/f/e:64m (MIGITIP supported)\n");
+        goto error;
+    }
+    unit = tolower(p[strlen(p)-1]);
+    p[strlen(p)-1] = '\0';
+    // sigh.
+    switch (unit) {
+        case 'm':
+            multiplier = 1024 * 1024;
+            break;
+        case 'g':
+            multiplier = 1024 * 1024 * 1024;
+            break;
+        case 't':
+            multiplier = 1024 * 1024;
+            multiplier *= 1024 * 1024;
+            break;
+        case 'p':
+            multiplier = 1024 * 1024;
+            multiplier *= 1024 * 1024 * 1024;
+            break;
+    }
+    base_size = atoi(p);
+    multiplier *= base_size;
+    // page_count is nearest-but-not-larger-than pages * psize
+    cf->page_count = multiplier / page_size;
+    assert(page_size * cf->page_count <= multiplier);
+
+    // final token would be a default free bucket
+    p = strtok_r(NULL, ",", &b);
+    // TODO: We reuse the original DEFINES for now.
+    // but if lowttl gets split up this needs to be its own set.
+    if (p != NULL) {
+        if (strcmp(p, "compact") == 0) {
+            cf->free_bucket = PAGE_BUCKET_COMPACT;
+        } else if (strcmp(p, "lowttl") == 0) {
+            cf->free_bucket = PAGE_BUCKET_LOWTTL;
+        } else if (strcmp(p, "chunked") == 0) {
+            cf->free_bucket = PAGE_BUCKET_CHUNKED;
+        } else if (strcmp(p, "default") == 0) {
+            cf->free_bucket = PAGE_BUCKET_DEFAULT;
+        } else {
+            fprintf(stderr, "Unknown extstore bucket: %s\n", p);
+            goto error;
+        }
+    } else {
+        // TODO: is this necessary?
+        cf->free_bucket = PAGE_BUCKET_DEFAULT;
+    }
+
+    // TODO: disabling until compact algorithm is improved.
+    if (cf->free_bucket != PAGE_BUCKET_DEFAULT) {
+        fprintf(stderr, "ext_path only presently supports the default bucket\n");
+        goto error;
+    }
+
+    return cf;
+error:
+    if (cf) {
+        if (cf->file)
+            free(cf->file);
+        free(cf);
+    }
+    return NULL;
+}
+
 #endif
