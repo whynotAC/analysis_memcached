@@ -1,0 +1,103 @@
+slabs文件分析
+===========================
+
+1 slabs文件中对外接口函数
+----------------------------
+
+| 函数名	|	函数定义	|	作用	|	备注  |
+| ---- 	| ----- 	| ---- 	| ----- 	  |
+| `slabs_init` | `void slabs_init(const size_t limit, const double factor, const bool prealloc, const uint32_t *slab_sizes)` | 用于初始化slabclass结构体 | 无 |
+| `slabs_prefill_global` | `void slabs_prefill_global(void)` | 按照`slab_page_size`切分申请的内存空间，存放在`slabclass[0]`中 | 无 |
+| `slabs_clsid` | `unsigned int slabs_clsid(const size_t size)` | 给定对象大小，查找其对应的`slabclass`的编号 | 无 |
+| `slabs_alloc` | `void *slabs_alloc(const size_t size, unsigned int id, uint64_t *total_bytes, unsigned int flags)` | 锁定`slabs_lock`，调用`do_slabs_alloc`分配内存空间 |无|
+| `slabs_free` | `void slabs_free(void *ptr, size_t size, unsigned int id)` | 锁定`slabs_lock`，调用`do_slabs_free`释放申请的内存空间 | 无 |
+| `slabs_adjust_mem_requested` | `void slabs_adjust_mem_requested(unsigned int id, size_t old, size_t ntotal)` | 根据`id`来调整`slabclass`的`requested`字段值 | 无 |
+| `slabs_adjust_mem_limit` | `bool slabs_adjust_mem_limit(size_t new_mme_limit)` | 锁定`slabs_lock`，调用`do_slabs_adjust_mem_limit`来调整内存大小 | 无 |
+| `get_stats` | `bool get_stats(const char *state_type, int nkey, ADD_STAT add_stats, void *c)` | 用与查看`slabclass`的内存空间使用情况 | 无 |
+| `fill_slab_stats_automove` | `void fill_slab_stats_automove(slab_stats_automove *am)`| 锁定`slabs_lock`，并根据`slabclass`情况填充`am`数组 | 此函数可能于内存管理线程有关 |
+| `global_page_pool_size` | `unsigned int global_page_pool_size(bool *mem_flag)` | 用于检测`mem_malloced`是否超过`mem_limit` | 无 |
+| `slabs_stats` | `void slabs_stats(ADD_STAT add_stats, void *c)` | 锁定`slabs_lock`，调用`do_slabs_stats`函数填充`add_stats`参数 | 此函数可以用于观察`slabclass`内存情况 |
+| `slabs_available_chunks` | `unsigned int slabs_available_chunks(unsigned int id, bool *mem_flag, uint64_t *total_bytes, unsigned int *chunks_preslab)` | 其用于观察`slabclass`整体内存使用情况 | 这个仅为标记统计 |
+| `slabs_mlock` | `void slabs_mlock(void)` | 用于包装锁定`slabs_lock`的函数 | 无 |
+| `slabs_munlock` | `void slabs_munlock(void)` | 用于包装解锁`slabs_lock`的函数 | 无 |
+| `start_slab_maintenance_thread` | `int start_slab_maintenance_thread(void)` | 用于启动`slabclass`调整线程的函数 | 无 |
+| `stop_slab_maintenance_thread` | `void stop_slab_maintenance_thread(void)` | 用于关闭`slabclass`调整线程的函数 | 无 |
+| `slabs_reassign` | `enum reassign_result_type slabs_reassign(int src, int dst)` | 调整`id`为`src/dst`的`slabclass`的函数 | 其会抢占`slabs_rebalance_lock`锁 | 
+| `slabs_rebalancer_pause` | `void slabs_rebalancer_pause(void)` | 暂停`slabclass`调整线程 | 无 | 
+| `slabs_rebalancer_resume` | `void slabs_rebalancer_resume(void)` | 恢复`slabclass`调整线程运行 | 无 | 
+
+2 slabs文件中全局变量
+---------------------------
+**slabs文件中重要结构体**
+
+>		// powers-of-N allocation structures
+>		typedef struct {
+>			unsigned int size;		//	sizeof of items
+>			unsigned int perslab;	// 	how many items per slab
+>			
+>			void *slots;				// list of items ptrs
+>			unsigned int sl_curr;	//	total free items in list
+>
+>			unsigned int slabs;		//	how many slabs were allocated for this class
+>			
+>			void **slab_list;		//	array of slab pointers
+>			unsigned int list_size;	//	size of prev array
+>
+>			size_t requested;		//	The number of requested bytes
+>		} slabclass_t;
+>
+>		#define DEFAULT_SLAB_BULK_CHECK 1
+>
+>		enum move_status {
+>			MOVE_PASS=0, MOVE_FROM_SLAB, MOVE_FROM_LRU, MOVE_BUSY, MOVE_LOCKED
+>		};
+>
+>		#define SLAB_MOVE_MAX_LOOPS 1000
+
+**slabs文件中全局变量**
+
+|	变量名	|	定义	|	是否为静态变量	|	作用    |  备注   |
+| ------- | ------- | ------------- | --------- | ------ |
+| `slabclass` | `slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES]` | 是 | 用于存放所有`slabclass`，管理内存空间 | 无 |
+| `mem_limit` | `size_t mem_limit = 0` | 是 | 用于记录整个内存空间的大小 | 无 |
+| `mem_malloced` | `size_t mem_malloced = 0` | 是 | 用于记录已用内存空间的大小 |无|
+| `mem_limit_reached` | `bool mem_limit_reached = false` | 是 | 用于标记已用内存是否超过`mem_limit`的值 | 无 |
+| `power_largest` | `int power_largest` | 是 | 用于记录最大的`slabclass`的下标|无|
+| `mem_base` | `void *mem_base = NULL` | 是 | 用于指向分配内存空间的基地址 | 无 |
+| `mem_current` | `void *mem_current = NULL` | 是 | 用于记录当前可分配空间的开始地址| 无 |
+| `mem_avail` | `size_t mem_avail = 0` | 是 | 用于记录已分配空间的大小 | 无 |
+| `slabs_lock` | `pthread_mutex_t slabs_lock = PTHREAD_MUTEX_INITIALIZER` |是| 用于控制访问`slabclass`的互斥量 | 无 |
+| `slabs_rebalance_lock` | `pthread_mutex_t slabs_rebalance_lock = PTHREAD_MUTEX_INITIALIZER` | 是 | 用于控制`slab_rebalance_thread`线程行为的互斥量|无|
+| `slab_rebalance_cond` | `pthread_cond_t slab_rebalance_cond = PTHREAD_COND_INITIALIZER` | 是 | 用于控制`slab_rebalance_thread`线程的行为的信号量| 无 |
+| `do_run_slab_thread` | `volatile int do_run_slab_thread = 1` | 是 | 无 | 无 | 
+| `do_run_slab_rebalance_thread` | `volatile int do_run_slab_rebalance_thread = 1` | 是 | 用于控制`slab_rebalance_thread`是否停止运行 | 无 |
+| `slab_bulk_check` | `int slab_bulk_check = 1` | 否 |用于控制`slab_rebalance_thread`线程每次移动`item`的个数 | 无 |
+| `rebalance_tid` | `pthread_t rebalance_tid` | 是 | 用于记录`slab_rebalance_thread`线程的`ID` | 无 |
+
+3 slabs文件中静态函数
+-----------------------------------
+
+|	函数名		|	函数定义	|	作用		|  备注  |
+| --------	| --------	| ----------	| ------ |
+| `grow_slab_list` | `int grow_slab_list(const unsigned int id)` | 增加`slabclass`中的`slab_list`空间,方便添加`slab/chunk` | `slabclass`的空间按照原来的两倍进行增加 |
+| `do_slabs_newslab` | `int do_slabs_newslab(const unsigned int id)` | 为指定`id`的`slabclass`分配一个`slab/chunk`空间 | 此函数用于分配申请的内存空间 |
+| `memory_allocate` | `void *memory_allocate(size_t size)` | 从申请的内存空间中分配`size`大小的内存空间 | 此函数用于分配直接从内存申请的内存空间 |
+| `do_slabs_free` | `void do_slabs_free(void *ptr, const size_t size, unsigned int id)` | 用于释放内存空间到`id`指定的`slabclass`中 | 注意按照`item`中的`it_flags`进行分类释放内存空间 |
+| `slabs_preallocate` | `void slabs_preallocate(const unsigned int maxslabs)` | 给每一个`slabclass`预分配内存 | 预分配内存大小为一个`slab/chunk` |
+|`split_slab_page_into_freelist` | `void split_slab_page_into_freelist(char *ptr, const unsigned int id)` | 将申请的内存空间按照`slabclass[id]`的大小进行划分|申请的`slab/chunk`内存空间将分为`slabclass[id]`的大小，然后存放在空闲链表中 |
+| `get_page_from_global_pool` | `void *get_page_from_global_pool(void)` | 从`slabclass[SLAB_GLOBAL_PAGE_POOL]`中申请内存空间 | 无 |
+| `do_slabs_alloc` | `void *do_slabs_alloc(const size_t size, unsigned int id, uint64_t *total_bytes, unsigned int flags)` | 用于申请指定大小内存的`slabclass`中的`item` | 若无空闲`item`，则申请新`slab/chunk`来填充`slabclass` |
+| `do_slabs_free_chunked` | `void do_slabs_free_chunked(item *it, const size_t size)` | 用于释放`item_chunk`的内存空间 | `item`中的`it_flags`中存在`ITEM_CHUNK`标识 |
+| `nz_strcmp` | `int nz_strcmp(int nzlength, const char *nz, const char *z)` | 用于判断字符串`nz`和`z`是否相同 | 无 |
+| `do_slabs_stats` | `void do_slabs_stats(ADD_STAT add_stats, void *c)` | 用于统计`slabclass`的信息 | 无 |
+| `memory_release` | `void memory_release()` | 用于释放申请的内存空间，此函数只当`settings.slab_reassign`为`true`时使用 | 无 |
+| `do_slabs_adjust_mem_limit` | `bool do_slabs_adjust_mem_limit(size_t new_mem_limit)` | 用于动态调整申请内存空间的大小 | 只能够释放内存空间 |
+| `slab_rebalance_start` | `int slab_rebalance_start(void)` | 用于开启`slab_rebalance`线程 | 无 |
+| `slab_rebalance_alloc` | `void *slab_rebalance_alloc(const size_t size, unsigned int id)` | 用于`slab_rebalance`现场中调用 | 无 |
+| `slab_rebalance_cut_free` | `void slab_rebalance_cut_free(slabclass_t *s_cls, item *it)` | 用于将源`slabclass`中的`item`拖链 | 无 |
+| `slab_rebalance_move` | `int slab_rebalance_move(void)` | 用于将源`slabclass`中`item`进行转移 | 无 |
+| `slab_rebalance_finish` | `void slab_rebalancfinish(void)` | 用于`slab_rebalance`线程中完成时调用的函数 | 无 |
+| `slab_rebalance_thread` | `void *slab_rebalance_thread(void)` | `slab_rebalance`线程函数 | 无 |
+| `slabs_reassign_pick_any` | `int slabs_reassign_pick_any(int dst)` | 用于选择`slabclass`转移中的源空间 | 无 |
+| `do_slabs_reassign` | `enum reassign_result_type do_slabs_reassign(int src, int dst)` | 选择好源和目标的`slabclass`的`id`，然后开启内存空间的`rebalance` | 无 |
+
