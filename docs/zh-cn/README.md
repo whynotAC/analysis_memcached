@@ -1,3 +1,3 @@
-# ZH-CN/README
+# 暂无更新
 
-> An awesome project.
+敬请期待。
