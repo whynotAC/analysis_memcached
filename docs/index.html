@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Document</title>
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+  <meta name="description" content="Description">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0">
+  <link rel="stylesheet" href="//unpkg.com/docsify/lib/themes/vue.css">
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    window.$docsify = {
+      name: '<span>whynotAC</span><br/><br/><span>专注于分布式存储与计算</span>',
+      repo: 'https://github.com/whynotAC/analysis_memcached',
+      loadSidebar: true,
+      subMaxLevel: 3,
+      mergeNavbar: true,
+      notFoundPage: '_404.html',
+      loadNavbar: true,
+      disqus: 'shortname',
+      autoHeader: true,
+      plugins: [
+      function (hook) {
+        var footer = [
+          '<hr/>',
+          '<footer>',
+          '<span>本文档采用<a href="https://creativecommons.org/licenses/by-nc-nd/4.0/deed.zh" target="_blank">知识共同 署名-非商业性使用-禁止演绎 4.0 国际 许可协议</a></span>',
+          '<br/>',
+          '<span><a href="https://github.com/whynotAC">whynotAC</a> &copy;2019.</span>',
+          '<span>Proudly published with <a href="https://github.com/docsifyjs/docsify" target="_blank">docsify</a>.</span>',
+          '</footer>'
+        ].join('')
+
+        hook.afterEach(function (html) {
+          return html + footer
+        })
+      }
+  ]
+    }
+  </script>
+  <script src="//unpkg.com/docsify/lib/docsify.min.js"></script>
+  <!-- 图片放大 -->
+  <script src="//unpkg.com/docsify/lib/plugins/zoom-image.min.js"></script>
+  <!-- code blink -->
+  <script src="//unpkg.com/prismjs/components/prism-cpp.js"></script>
+  <script src="//unpkg.com/prismjs/components/prism-clike.js"></script>
+  <!-- copy -->
+  <script src="//unpkg.com/docsify-copy-code"></script>
+  <!-- theme -->
+  <link rel="stylesheet" href="//unpkg.com/docsify/themes/vue.css">
+  <!-- collection -->
+  <script>
+  var _hmt = _hmt || [];
+  (function() {
+    var hm = document.createElement("script");
+    hm.src = "https://hm.baidu.com/hm.js?f05414f8b7aad907a497fd2b186e8eef";
+    var s = document.getElementsByTagName("script")[0]; 
+    s.parentNode.insertBefore(hm, s);
+  })();
+  </script>
+</body>
+</html>
