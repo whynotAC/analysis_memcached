@@ -10,6 +10,7 @@
 </head>
 <body>
   <div id="app"></div>
+
   <script>
     window.$docsify = {
       name: '<span>whynotAC</span><br/><br/><span>专注于分布式存储与计算</span>',
@@ -18,21 +19,35 @@
       loadSidebar: true,
       subMaxLevel: 3,
       mergeNavbar: true,
-      notFoundPage: '_404.html',
+      // notFoundPage: true,
       loadNavbar: true,
       disqus: 'shortname',
       autoHeader: true,
       auto2top: true,
+      executeScript: true,
       plugins: [
       function (hook) {
         var footer = [
-          '<hr/>',
-          '<footer>',
-          '<span>本文档采用<a href="https://creativecommons.org/licenses/by-nc-nd/4.0/deed.zh" target="_blank">知识共同 署名-非商业性使用-禁止演绎 4.0 国际 许可协议</a></span>',
-          '<br/>',
-          '<span><a href="https://github.com/whynotAC">whynotAC</a> &copy;2019.</span>',
-          '<span>Proudly published with <a href="https://github.com/docsifyjs/docsify" target="_blank">docsify</a>.</span>',
-          '</footer>'
+          `
+          <hr/>
+          <p>
+          Donations
+          <br/>
+          读后有收获可以支付宝请作者喝杯奶茶，有疑问热烈欢迎添加作者微信搞基讨论：
+          </p>
+          <p>
+            <img src="./images/51574680212_.pic.jpg" style="width:150px;height:150px">
+            <img src="./images/41574680191_.pic.jpg" style="width:150px;height:150px">
+          </p>
+          <footer>
+          <span>本文档采用<a href="https://creativecommons.org/licenses/by-nc-nd/4.0/deed.zh
+          target="_blank">知识共同 署名-非商业性使用-禁止演绎 4.0 国际 许可协议</a></span>
+          <br/>
+          <span><a href="https://github.com/whynotAC">whynotAC</a> &copy;2019.</span>
+          <span>Proudly published with <a href="https://github.com/docsifyjs/docsify target="_blank">docsify</a>.</span>
+          </footer>'
+
+          ` 
         ].join('')
 
         hook.afterEach(function (html) {
@@ -53,6 +68,12 @@
   <!-- theme -->
   <link rel="stylesheet" href="//unpkg.com/docsify/themes/vue.css">
   <!-- collection -->
+
+  <!-- external-script -->
+   <script src="//unpkg.com/docsify/lib/plugins/external-script.min.js"></script>
+   <!-- <script type="text/javascript" src="//qzonestyle.gtimg.cn/qzone/hybrid/app/404/search_children.js" charset="utf-8" homePageUrl="http://localhost:3000/" homePageName="回到文档主页"></script> -->
+
+  <script src="https://code.jquery.com/jquery-1.11.3.js"></script>
   <script>
   var _hmt = _hmt || [];
   (function() {
@@ -62,5 +83,13 @@
     s.parentNode.insertBefore(hm, s);
   })();
   </script>
+  <script>
+
+  $(document).ready(function(){ 
+    console.log(11111);
+　　$('.desc a').href = "http://localhost:3000/"
+  }); 
+</script>
+
 </body>
 </html>
